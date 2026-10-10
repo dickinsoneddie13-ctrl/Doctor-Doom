@@ -1,0 +1,1 @@
+- [Permisos de emojis en Discord](discord-emoji-permissions.md) — Gestionar expresiones debe estar habilitado para el rol del bot en cada servidor donde sincroniza iconos.
