@@ -7,8 +7,8 @@ import {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
+  GuildMember,
   ModalBuilder,
-  PermissionsBitField,
   Routes,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
@@ -17,13 +17,13 @@ import {
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Guild,
-  type GuildMember,
   type Interaction,
   type Message,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
   type VoiceState,
 } from "discord.js";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logger } from "./logger";
@@ -234,10 +234,39 @@ const ATTACHED_ASSETS_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../../attached_assets",
 );
+const AUTHORIZED_VOICE_CHANNEL_IDS = new Set([
+  "881820505466896394",
+  "882060722589290496",
+  "1552833195156840619",
+  "1552787974570381362",
+  "1553938625110999140",
+  "1552787864268308510",
+]);
+const AUTHORIZED_CONTROL_ROLE_IDS = new Set([
+  "1553907548501835916",
+  "881753080952160337",
+  "1558208679361257512",
+  "1552912737225674844",
+  "1552913091623256125",
+]);
+const ROOM_CLOSED_MESSAGE =
+  "La sala de farmeo está cerrada. Un usuario autorizado debe iniciar otra con /start.";
+const FARM_RELATED_MESSAGE_PATTERN =
+  /^!(list|lista|register|registro|start|stop|rol|cambiar_rol|cambiar)\b/;
+
+const START_COMMAND = new SlashCommandBuilder()
+  .setName("start")
+  .setDescription("Abre la sala de farmeo y habilita el registro de la partida")
+  .toJSON();
+const STOP_COMMAND = new SlashCommandBuilder()
+  .setName("stop")
+  .setDescription("Cierra la sala de farmeo y bloquea los registros")
+  .toJSON();
 const CHANGE_ROLE_COMMAND = new SlashCommandBuilder()
   .setName("cambiar_rol")
   .setDescription("Cambia tu rol y personaje después de registrarte")
   .toJSON();
+const APPLICATION_COMMANDS = [START_COMMAND, STOP_COMMAND, CHANGE_ROLE_COMMAND];
 
 type PendingRegistration = {
   role: string;
@@ -256,8 +285,25 @@ export type PlayerRegistration = {
   registeredAt: string;
 };
 
+type RoomStatus = "open" | "closed";
+
+type RoomState = {
+  guildId: string;
+  voiceChannelId: string;
+  status: RoomStatus;
+  sessionId: string;
+  panelMessageId?: string;
+  openedByUserId?: string;
+  openedByUsername?: string;
+  closedByUserId?: string;
+  closedByUsername?: string;
+  openedAt?: string;
+  closedAt?: string;
+};
+
 const pendingRegistrations = new Map<string, PendingRegistration>();
 const registrations = new Map<string, PlayerRegistration>();
+const roomStates = new Map<string, RoomState>();
 const rosterMessages = new Map<string, string>();
 const registrationPanelMessages = new Map<string, string>();
 const messageDeletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -274,18 +320,196 @@ let lastDiscordError: string | undefined;
 
 const pendingKey = (guildId: string, userId: string) => `${guildId}:${userId}`;
 const registrationKey = (guildId: string, userId: string) => `${guildId}:${userId}`;
+const roomKey = (guildId: string, voiceChannelId: string) =>
+  `${guildId}:${voiceChannelId}`;
+
+function isAuthorizedVoiceChannel(channelId: string | null | undefined) {
+  return Boolean(channelId && AUTHORIZED_VOICE_CHANNEL_IDS.has(channelId));
+}
+
+function memberHasControlRole(member: GuildMember | null | undefined) {
+  if (!member) return false;
+  return member.roles.cache.some((role) =>
+    AUTHORIZED_CONTROL_ROLE_IDS.has(role.id),
+  );
+}
+
+function getRoomState(guildId: string, voiceChannelId: string): RoomState {
+  const key = roomKey(guildId, voiceChannelId);
+  const existing = roomStates.get(key);
+  if (existing) return existing;
+
+  const created: RoomState = {
+    guildId,
+    voiceChannelId,
+    status: "closed",
+    sessionId: "",
+  };
+  roomStates.set(key, created);
+  return created;
+}
+
+function isRoomOpen(guildId: string, voiceChannelId: string) {
+  const room = roomStates.get(roomKey(guildId, voiceChannelId));
+  return room?.status === "open" && Boolean(room.sessionId);
+}
+
+function isActiveSession(
+  guildId: string,
+  voiceChannelId: string,
+  sessionId: string | undefined,
+) {
+  if (!sessionId) return false;
+  const room = roomStates.get(roomKey(guildId, voiceChannelId));
+  return room?.status === "open" && room.sessionId === sessionId;
+}
+
+function clearChannelSessionData(guildId: string, voiceChannelId: string) {
+  const userIds = new Set<string>();
+  for (const [key, registration] of registrations) {
+    if (
+      registration.guildId === guildId &&
+      registration.voiceChannelId === voiceChannelId
+    ) {
+      userIds.add(registration.discordUserId);
+      registrations.delete(key);
+    }
+  }
+
+  for (const userId of userIds) {
+    pendingRegistrations.delete(pendingKey(guildId, userId));
+  }
+}
+
+function getVoicePlayerCount(voiceChannelId: string) {
+  const channel = client?.channels.cache.get(voiceChannelId);
+  if (!channel || !channel.isVoiceBased()) return 0;
+  return channel.members.filter((member) => !member.user.bot).size;
+}
+
+async function resolveGuildMember(
+  interaction: Interaction,
+): Promise<GuildMember | null> {
+  if (interaction.member instanceof GuildMember) {
+    return interaction.member;
+  }
+  if (!interaction.guild) return null;
+  try {
+    return await interaction.guild.members.fetch(interaction.user.id);
+  } catch (error) {
+    logger.warn(
+      { err: error, userId: interaction.user.id, guildId: interaction.guild.id },
+      "Could not fetch guild member for farm room command",
+    );
+    return null;
+  }
+}
+
+function isFarmRelatedMessageCommand(content: string) {
+  return FARM_RELATED_MESSAGE_PATTERN.test(content.trim().toLowerCase());
+}
 
 function isPendingValid(pending: PendingRegistration | undefined) {
   return Boolean(pending && Date.now() - pending.createdAt < 5 * 60 * 1000);
 }
 
-function buildRegistrationPanel() {
-  const button = new ButtonBuilder()
-    .setCustomId("mvr:register")
+function buildRegistrationButton(sessionId: string, disabled = false) {
+  return new ButtonBuilder()
+    .setCustomId(`mvr:register:${sessionId}`)
     .setLabel("Registrarme para la partida")
-    .setStyle(ButtonStyle.Primary);
+    .setStyle(ButtonStyle.Primary)
+    .setDisabled(disabled);
+}
 
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(button);
+function buildRegistrationPanel(sessionId: string, disabled = false) {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    buildRegistrationButton(sessionId, disabled),
+  );
+}
+
+function buildPublicRoleMenu(sessionId: string, disabled = false) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`mvr:roleopen:${sessionId}`)
+    .setPlaceholder("Elige tu rol: Vanguard, Duelist o Strategist")
+    .setDisabled(disabled)
+    .addOptions(
+      ROLE_OPTIONS.map((option) => ({
+        label: option.label,
+        value: option.value,
+        emoji: option.emoji,
+      })),
+    );
+
+  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
+}
+
+function buildRoomComponents(sessionId: string, disabled = false) {
+  return [
+    buildRegistrationPanel(sessionId, disabled),
+    buildPublicRoleMenu(sessionId, disabled),
+  ];
+}
+
+async function replyEphemeral(
+  interaction:
+    | ChatInputCommandInteraction
+    | ButtonInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction,
+  content: string,
+) {
+  if (interaction.deferred || interaction.replied) {
+    await interaction.editReply({ content, embeds: [], components: [] });
+    return;
+  }
+
+  await interaction.reply({ content, ephemeral: true });
+}
+
+async function deferEphemeral(
+  interaction:
+    | ChatInputCommandInteraction
+    | ButtonInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction,
+) {
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ ephemeral: true });
+  }
+}
+
+async function rejectClosedRoom(
+  interaction:
+    | ChatInputCommandInteraction
+    | ButtonInteraction
+    | StringSelectMenuInteraction
+    | ModalSubmitInteraction,
+) {
+  await replyEphemeral(interaction, ROOM_CLOSED_MESSAGE);
+}
+
+async function invalidatePanelButtons(
+  guildId: string,
+  voiceChannelId: string,
+  sessionId: string,
+) {
+  const channel = client?.channels.cache.get(voiceChannelId);
+  if (!channel || !channel.isTextBased() || !channel.isSendable()) return;
+
+  const room = getRoomState(guildId, voiceChannelId);
+  if (!room.panelMessageId) return;
+
+  try {
+    const panelMessage = await channel.messages.fetch(room.panelMessageId);
+    await panelMessage.edit({
+      components: buildRoomComponents(sessionId, true),
+    });
+  } catch (error) {
+    logger.warn(
+      { err: error, channelId: voiceChannelId, messageId: room.panelMessageId },
+      "Could not invalidate previous farm room registration buttons",
+    );
+  }
 }
 
 function buildRoleMenu(userId: string, mode: PendingRegistration["mode"]) {
@@ -531,8 +755,8 @@ function buildRegistrationModal(userId: string, role: string, character: string)
     .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(gameId));
 }
 
-function buildRosterEmbed(registrationList: PlayerRegistration[]) {
-  const roleFields = ROLE_ORDER.map((role) => {
+function buildRoleFields(registrationList: PlayerRegistration[]) {
+  return ROLE_ORDER.map((role) => {
     const players = registrationList
       .filter((registration) => registration.role === role)
       .map(
@@ -546,7 +770,9 @@ function buildRosterEmbed(registrationList: PlayerRegistration[]) {
       inline: false,
     };
   });
+}
 
+function buildRosterEmbed(registrationList: PlayerRegistration[]) {
   return new EmbedBuilder()
     .setColor(0x1d9bf0)
     .setTitle(
@@ -556,9 +782,41 @@ function buildRosterEmbed(registrationList: PlayerRegistration[]) {
       `Cupos ocupados: **${registrationList.length}/${MAX_PLAYERS}**\n` +
         "Los roles vacíos aparecen como disponibles.",
     )
-    .addFields(roleFields)
+    .addFields(buildRoleFields(registrationList))
     .setFooter({
       text: "Registro actualizado por Marvel Rivals",
+    });
+}
+
+function buildOpenRoomEmbed(
+  openedByUsername: string,
+  registrationList: PlayerRegistration[],
+  voicePlayerCount: number,
+) {
+  return new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("Bienvenido al farmeo")
+    .setDescription(
+      `Sala abierta por **${openedByUsername}**.\n` +
+        "Pulsa el botón azul para registrarte: elige rol, personaje e ID de Marvel Rivals.\n\n" +
+        `Jugadores presentes en voz: **${voicePlayerCount}/${MAX_PLAYERS}**\n` +
+        `Registros confirmados: **${registrationList.length}/${MAX_PLAYERS}**`,
+    )
+    .addFields(buildRoleFields(registrationList))
+    .setFooter({
+      text: "Vanguard · Duelist · Strategist",
+    });
+}
+
+function buildClosedRoomEmbed(closedByUsername: string) {
+  return new EmbedBuilder()
+    .setColor(0xed4245)
+    .setTitle("Sala de farmeo cerrada")
+    .setDescription(
+      `Cerrada por **${closedByUsername}**.\nYa no se aceptan registros.`,
+    )
+    .setFooter({
+      text: "Usa /start para abrir una nueva sala",
     });
 }
 
@@ -621,48 +879,234 @@ async function deleteRegistrationPanel(guildId: string, userId: string) {
   await deleteTemporaryMessage(panelMessage);
 }
 
-async function publishRosterForChannel(guildId: string, voiceChannelId: string) {
-  const channelKey = `${guildId}:${voiceChannelId}`;
+async function refreshRoomPanel(guildId: string, voiceChannelId: string) {
+  const room = getRoomState(guildId, voiceChannelId);
+  if (room.status !== "open") return;
+
   const channel = client?.channels.cache.get(voiceChannelId);
   if (!channel || !channel.isTextBased() || !channel.isSendable()) return;
 
   const registrationList = getChannelRegistrations(guildId, voiceChannelId);
-  const embeds = [buildRosterEmbed(registrationList)];
-  const existingMessageId = rosterMessages.get(channelKey);
+  const payload = {
+    embeds: [
+      buildOpenRoomEmbed(
+        room.openedByUsername ?? "un usuario autorizado",
+        registrationList,
+        getVoicePlayerCount(voiceChannelId),
+      ),
+    ],
+    components: buildRoomComponents(room.sessionId),
+  };
 
-  if (existingMessageId) {
+  if (room.panelMessageId) {
     try {
-      const existingMessage = await channel.messages.fetch(existingMessageId);
-      await existingMessage.edit({ embeds });
-      scheduleMessageDeletion(existingMessage);
+      const existingMessage = await channel.messages.fetch(room.panelMessageId);
+      await existingMessage.edit(payload);
       return;
     } catch (error) {
       logger.warn(
         { err: error, channelId: voiceChannelId },
-        "Previous roster message could not be updated",
+        "Farm room panel could not be updated; publishing a new one",
       );
-      rosterMessages.delete(channelKey);
+      room.panelMessageId = undefined;
     }
   }
 
-  const rosterMessage = await channel.send({ embeds });
-  rosterMessages.set(channelKey, rosterMessage.id);
-  scheduleMessageDeletion(rosterMessage);
+  const panelMessage = await channel.send(payload);
+  room.panelMessageId = panelMessage.id;
+}
+
+async function publishRosterForChannel(guildId: string, voiceChannelId: string) {
+  if (!isRoomOpen(guildId, voiceChannelId)) return;
+  await refreshRoomPanel(guildId, voiceChannelId);
 }
 
 async function publishRoster(registration: PlayerRegistration) {
   await publishRosterForChannel(registration.guildId, registration.voiceChannelId);
 }
 
+async function requireAuthorizedControl(
+  interaction: ChatInputCommandInteraction,
+) {
+  await deferEphemeral(interaction);
+
+  const guildId = interaction.guildId;
+  const channelId = interaction.channelId;
+  if (!guildId) {
+    await replyEphemeral(
+      interaction,
+      "Este comando solo funciona dentro de un servidor.",
+    );
+    return null;
+  }
+
+  if (!isAuthorizedVoiceChannel(channelId)) {
+    await replyEphemeral(
+      interaction,
+      "Los comandos de gestión de sala solo pueden usarse en un canal de voz autorizado.",
+    );
+    return null;
+  }
+
+  const member = await resolveGuildMember(interaction);
+  if (!memberHasControlRole(member)) {
+    await replyEphemeral(
+      interaction,
+      "No tienes un rol autorizado para controlar la sala de farmeo.",
+    );
+    return null;
+  }
+
+  return { guildId, channelId, member: member as GuildMember };
+}
+
+async function handleStartCommand(interaction: ChatInputCommandInteraction) {
+  const context = await requireAuthorizedControl(interaction);
+  if (!context) return;
+
+  const { guildId, channelId, member } = context;
+  const previousRoom = getRoomState(guildId, channelId);
+  if (previousRoom.panelMessageId && previousRoom.sessionId) {
+    await invalidatePanelButtons(guildId, channelId, previousRoom.sessionId);
+  }
+
+  clearChannelSessionData(guildId, channelId);
+
+  const room = getRoomState(guildId, channelId);
+  room.status = "open";
+  room.sessionId = randomUUID();
+  room.openedByUserId = member.id;
+  room.openedByUsername = member.displayName;
+  room.openedAt = new Date().toISOString();
+  room.closedByUserId = undefined;
+  room.closedByUsername = undefined;
+  room.closedAt = undefined;
+  room.panelMessageId = undefined;
+
+  const channel = interaction.channel;
+  if (!channel || !channel.isTextBased() || !channel.isSendable()) {
+    await replyEphemeral(
+      interaction,
+      "No pude publicar el panel de la sala en este canal.",
+    );
+    room.status = "closed";
+    room.sessionId = "";
+    return;
+  }
+
+  const panelMessage = await channel.send({
+    embeds: [
+      buildOpenRoomEmbed(
+        member.displayName,
+        [],
+        getVoicePlayerCount(channelId),
+      ),
+    ],
+    components: buildRoomComponents(room.sessionId),
+  });
+  room.panelMessageId = panelMessage.id;
+
+  await replyEphemeral(
+    interaction,
+    "Sala de farmeo abierta. El registro de la partida ya está habilitado.",
+  );
+}
+
+async function handleStopCommand(interaction: ChatInputCommandInteraction) {
+  const context = await requireAuthorizedControl(interaction);
+  if (!context) return;
+
+  const { guildId, channelId, member } = context;
+  const room = getRoomState(guildId, channelId);
+  if (room.status !== "open") {
+    await rejectClosedRoom(interaction);
+    return;
+  }
+
+  const sessionId = room.sessionId;
+  room.status = "closed";
+  room.closedByUserId = member.id;
+  room.closedByUsername = member.displayName;
+  room.closedAt = new Date().toISOString();
+  clearChannelSessionData(guildId, channelId);
+
+  const closedEmbed = buildClosedRoomEmbed(member.displayName);
+  const channel = interaction.channel;
+  if (channel?.isTextBased() && channel.isSendable() && room.panelMessageId) {
+    try {
+      const panelMessage = await channel.messages.fetch(room.panelMessageId);
+      await panelMessage.edit({
+        embeds: [closedEmbed],
+        components: buildRoomComponents(sessionId || "closed", true),
+      });
+    } catch (error) {
+      logger.warn(
+        { err: error, channelId },
+        "Could not update the farm room panel on /stop; sending a new closed embed",
+      );
+      const closedMessage = await channel.send({
+        embeds: [closedEmbed],
+        components: buildRoomComponents(sessionId || "closed", true),
+      });
+      room.panelMessageId = closedMessage.id;
+    }
+  } else if (channel?.isTextBased() && channel.isSendable()) {
+    const closedMessage = await channel.send({
+      embeds: [closedEmbed],
+      components: buildRoomComponents(sessionId || "closed", true),
+    });
+    room.panelMessageId = closedMessage.id;
+  }
+
+  await replyEphemeral(interaction, "Sala de farmeo cerrada. Ya no se aceptan registros.");
+}
+
+function resolveFarmVoiceChannelId(
+  guildId: string,
+  channelId: string | null | undefined,
+  member: GuildMember | null,
+) {
+  if (isAuthorizedVoiceChannel(channelId) && channelId) return channelId;
+  const voiceChannelId = member?.voice.channelId;
+  if (isAuthorizedVoiceChannel(voiceChannelId) && voiceChannelId) {
+    return voiceChannelId;
+  }
+  return undefined;
+}
+
 async function handleButtonInteraction(interaction: ButtonInteraction) {
-  if (interaction.customId !== "mvr:register") return;
+  const [prefix, type, sessionId] = interaction.customId.split(":");
+  if (prefix !== "mvr" || type !== "register") return;
+
+  await deferEphemeral(interaction);
 
   const guildId = interaction.guildId;
   if (!guildId) {
-    await interaction.reply({
-      content: "Este registro solo está disponible dentro de un servidor.",
-      ephemeral: true,
-    });
+    await replyEphemeral(
+      interaction,
+      "Este registro solo está disponible dentro de un servidor.",
+    );
+    return;
+  }
+
+  const member = await resolveGuildMember(interaction);
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    guildId,
+    interaction.channelId,
+    member,
+  );
+
+  if (
+    !voiceChannelId ||
+    !isRoomOpen(guildId, voiceChannelId) ||
+    !isActiveSession(guildId, voiceChannelId, sessionId)
+  ) {
+    await invalidatePanelButtons(
+      guildId,
+      interaction.channelId,
+      sessionId || "closed",
+    );
+    await rejectClosedRoom(interaction);
     return;
   }
 
@@ -670,43 +1114,132 @@ async function handleButtonInteraction(interaction: ButtonInteraction) {
     registrationKey(guildId, interaction.user.id),
   );
   if (existingRegistration) {
-    await interaction.reply({
-      content:
-        `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}** ` +
+    await replyEphemeral(
+      interaction,
+      `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}** ` +
         `con el ID **${existingRegistration.gameId}**.\n\n` +
         "No puedes registrarte otra vez. Si necesitas cambiarlo, usa `/cambiar_rol`.",
-      ephemeral: true,
-    });
+    );
     return;
   }
 
-  const member = interaction.member as GuildMember | null;
   const voiceChannel = member?.voice.channel;
-  if (!voiceChannel) {
-    await interaction.reply({
-      content: "Debes estar dentro de un canal de voz para registrarte.",
-      ephemeral: true,
-    });
+  if (!voiceChannel || voiceChannel.id !== voiceChannelId) {
+    await replyEphemeral(
+      interaction,
+      "Debes estar dentro de este canal de voz para registrarte.",
+    );
     return;
   }
 
   if (
     getChannelRegistrations(guildId, voiceChannel.id).length >= MAX_PLAYERS
   ) {
-    await interaction.reply({
-      content: `Este canal ya está lleno: **${MAX_PLAYERS}/${MAX_PLAYERS}** jugadores.`,
-      ephemeral: true,
-    });
+    await replyEphemeral(
+      interaction,
+      `Este canal ya está lleno: **${MAX_PLAYERS}/${MAX_PLAYERS}** jugadores.`,
+    );
     return;
   }
 
-  await interaction.reply({
+  await interaction.editReply({
     content: "Primero selecciona el rol que vas a jugar:",
     components: [buildRoleMenu(interaction.user.id, "register")],
-    ephemeral: true,
   });
-  await deleteTemporaryMessage(interaction.message);
-  registrationPanelMessages.delete(pendingKey(guildId, interaction.user.id));
+}
+
+async function handlePublicRoleSelection(interaction: StringSelectMenuInteraction) {
+  const [prefix, type, sessionId] = interaction.customId.split(":");
+  if (prefix !== "mvr" || type !== "roleopen") return;
+
+  await deferEphemeral(interaction);
+
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await replyEphemeral(
+      interaction,
+      "Este registro solo está disponible dentro de un servidor.",
+    );
+    return;
+  }
+
+  const member = await resolveGuildMember(interaction);
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    guildId,
+    interaction.channelId,
+    member,
+  );
+  const role = interaction.values[0];
+
+  if (
+    !voiceChannelId ||
+    !isRoomOpen(guildId, voiceChannelId) ||
+    !isActiveSession(guildId, voiceChannelId, sessionId)
+  ) {
+    await invalidatePanelButtons(
+      guildId,
+      interaction.channelId,
+      sessionId || "closed",
+    );
+    await rejectClosedRoom(interaction);
+    return;
+  }
+
+  const existingRegistration = registrations.get(
+    registrationKey(guildId, interaction.user.id),
+  );
+  if (existingRegistration) {
+    await replyEphemeral(
+      interaction,
+      `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}** ` +
+        `con el ID **${existingRegistration.gameId}**.\n\n` +
+        "No puedes registrarte otra vez. Si necesitas cambiarlo, usa `/cambiar_rol`.",
+    );
+    return;
+  }
+
+  if (!member?.voice.channel || member.voice.channel.id !== voiceChannelId) {
+    await replyEphemeral(
+      interaction,
+      "Debes estar dentro de este canal de voz para registrarte.",
+    );
+    return;
+  }
+
+  if (getChannelRegistrations(guildId, voiceChannelId).length >= MAX_PLAYERS) {
+    await replyEphemeral(
+      interaction,
+      `Este canal ya está lleno: **${MAX_PLAYERS}/${MAX_PLAYERS}** jugadores.`,
+    );
+    return;
+  }
+
+  if (!role) {
+    await replyEphemeral(interaction, "Selecciona un rol válido para continuar.");
+    return;
+  }
+
+  pendingRegistrations.set(pendingKey(guildId, interaction.user.id), {
+    role,
+    createdAt: Date.now(),
+    mode: "register",
+  });
+
+  await interaction.message
+    .edit({
+      components: buildRoomComponents(sessionId),
+    })
+    .catch(() => undefined);
+
+  await interaction.editReply({
+    content: `Rol seleccionado: **${role}**\nAhora selecciona tu personaje:`,
+    components: buildCharacterMenus(
+      interaction.user.id,
+      guildId,
+      role,
+      "register",
+    ),
+  });
 }
 
 async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
@@ -722,20 +1255,34 @@ async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
     return;
   }
 
+  await interaction.deferUpdate();
+
+  const guildId = interaction.guildId ?? "";
+  const member = await resolveGuildMember(interaction);
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    guildId,
+    interaction.channelId,
+    member,
+  );
+  if (!guildId || !voiceChannelId || !isRoomOpen(guildId, voiceChannelId)) {
+    await rejectClosedRoom(interaction);
+    return;
+  }
+
   const role = interaction.values[0];
   if (!role) return;
 
-  pendingRegistrations.set(pendingKey(interaction.guildId ?? "", userId), {
+  pendingRegistrations.set(pendingKey(guildId, userId), {
     role,
     createdAt: Date.now(),
     mode: mode === "change" ? "change" : "register",
   });
 
-  await interaction.update({
+  await interaction.editReply({
     content: `Rol seleccionado: **${role}**\nAhora selecciona tu personaje:`,
     components: buildCharacterMenus(
       userId,
-      interaction.guildId ?? "",
+      guildId,
       role,
       mode === "change" ? "change" : "register",
     ),
@@ -745,12 +1292,25 @@ async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
 async function handleChangeRoleCommand(
   interaction: ChatInputCommandInteraction,
 ) {
+  await deferEphemeral(interaction);
+
   const guildId = interaction.guildId;
   if (!guildId) {
-    await interaction.reply({
-      content: "Este comando solo funciona dentro de un servidor.",
-      ephemeral: true,
-    });
+    await replyEphemeral(
+      interaction,
+      "Este comando solo funciona dentro de un servidor.",
+    );
+    return;
+  }
+
+  const member = await resolveGuildMember(interaction);
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    guildId,
+    interaction.channelId,
+    member,
+  );
+  if (!voiceChannelId || !isRoomOpen(guildId, voiceChannelId)) {
+    await rejectClosedRoom(interaction);
     return;
   }
 
@@ -758,20 +1318,18 @@ async function handleChangeRoleCommand(
     registrationKey(guildId, interaction.user.id),
   );
   if (!registration) {
-    await interaction.reply({
-      content:
-        "Todavía no tienes un registro. Entra a un canal de voz y pulsa el botón de registro.",
-      ephemeral: true,
-    });
+    await replyEphemeral(
+      interaction,
+      "Todavía no tienes un registro. Pulsa el botón de registro de la sala abierta.",
+    );
     return;
   }
 
-  const member = interaction.member as GuildMember | null;
-  if (!member?.voice.channel) {
-    await interaction.reply({
-      content: "Debes estar dentro de un canal de voz para cambiar tu rol.",
-      ephemeral: true,
-    });
+  if (!member?.voice.channel || member.voice.channel.id !== voiceChannelId) {
+    await replyEphemeral(
+      interaction,
+      "Debes estar dentro de este canal de voz para cambiar tu rol.",
+    );
     return;
   }
 
@@ -781,12 +1339,11 @@ async function handleChangeRoleCommand(
     mode: "change",
   });
 
-  await interaction.reply({
+  await interaction.editReply({
     content:
       `Registro actual: **${registration.role} · ${registration.character}**.\n` +
       "Selecciona tu nuevo rol:",
     components: [buildRoleMenu(interaction.user.id, "change")],
-    ephemeral: true,
   });
 }
 
@@ -803,8 +1360,20 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
     return;
   }
 
+  const guildId = interaction.guildId ?? "";
+  const member = await resolveGuildMember(interaction);
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    guildId,
+    interaction.channelId,
+    member,
+  );
+  if (!guildId || !voiceChannelId || !isRoomOpen(guildId, voiceChannelId)) {
+    await rejectClosedRoom(interaction);
+    return;
+  }
+
   const pending = pendingRegistrations.get(
-    pendingKey(interaction.guildId ?? "", userId),
+    pendingKey(guildId, userId),
   );
   if (!isPendingValid(pending)) {
     await interaction.update({
@@ -862,36 +1431,47 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
     return;
   }
 
+  await deferEphemeral(interaction);
+
   const guildId = interaction.guildId ?? "";
+  const member = await resolveGuildMember(interaction);
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    guildId,
+    interaction.channelId,
+    member,
+  );
+  if (!guildId || !voiceChannelId || !isRoomOpen(guildId, voiceChannelId)) {
+    await rejectClosedRoom(interaction);
+    return;
+  }
+
   const existingRegistration = registrations.get(
     registrationKey(guildId, userId),
   );
   if (existingRegistration) {
     pendingRegistrations.delete(pendingKey(guildId, userId));
-    await interaction.reply({
-      content:
-        `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}**.\n` +
+    await replyEphemeral(
+      interaction,
+      `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}**.\n` +
         "Si quieres modificarlo, usa `/cambiar_rol`.",
-      ephemeral: true,
-    });
+    );
     return;
   }
 
-  const member = interaction.member as GuildMember | null;
   const voiceChannel = member?.voice.channel;
-  if (!voiceChannel || !("send" in voiceChannel)) {
-    await interaction.reply({
-      content: "Debes estar dentro de un canal de voz para completar el registro.",
-      ephemeral: true,
-    });
+  if (!voiceChannel || voiceChannel.id !== voiceChannelId || !("send" in voiceChannel)) {
+    await replyEphemeral(
+      interaction,
+      "Debes estar dentro de este canal de voz para completar el registro.",
+    );
     return;
   }
 
   if (getChannelRegistrations(guildId, voiceChannel.id).length >= MAX_PLAYERS) {
-    await interaction.reply({
-      content: `Este canal ya está lleno: **${MAX_PLAYERS}/${MAX_PLAYERS}** jugadores.`,
-      ephemeral: true,
-    });
+    await replyEphemeral(
+      interaction,
+      `Este canal ya está lleno: **${MAX_PLAYERS}/${MAX_PLAYERS}** jugadores.`,
+    );
     return;
   }
 
@@ -903,10 +1483,10 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
       (option) => option.value === character,
     )
   ) {
-    await interaction.reply({
-      content: "Ese personaje no está disponible para el rol seleccionado.",
-      ephemeral: true,
-    });
+    await replyEphemeral(
+      interaction,
+      "Ese personaje no está disponible para el rol seleccionado.",
+    );
     return;
   }
 
@@ -929,10 +1509,10 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
     pendingKey(registration.guildId, registration.discordUserId),
   );
 
-  await interaction.reply({
-    content: `Registro guardado: **${registration.role}** · **${registration.character}** · ID **${registration.gameId}**`,
-    ephemeral: true,
-  });
+  await replyEphemeral(
+    interaction,
+    `Registro guardado: **${registration.role}** · **${registration.character}** · ID **${registration.gameId}**`,
+  );
 
   await deleteRegistrationPanel(guildId, userId);
   await publishRoster(registration);
@@ -940,15 +1520,25 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
 
 async function handleInteraction(interaction: Interaction) {
   try {
-    if (
-      interaction.isChatInputCommand() &&
-      interaction.commandName === "cambiar_rol"
-    ) {
-      await handleChangeRoleCommand(interaction);
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "start") {
+        await handleStartCommand(interaction);
+        return;
+      }
+      if (interaction.commandName === "stop") {
+        await handleStopCommand(interaction);
+        return;
+      }
+      if (interaction.commandName === "cambiar_rol") {
+        await handleChangeRoleCommand(interaction);
+        return;
+      }
     } else if (interaction.isButton()) {
       await handleButtonInteraction(interaction);
     } else if (interaction.isStringSelectMenu()) {
-      if (interaction.customId.startsWith("mvr:role:")) {
+      if (interaction.customId.startsWith("mvr:roleopen:")) {
+        await handlePublicRoleSelection(interaction);
+      } else if (interaction.customId.startsWith("mvr:role:")) {
         await handleRoleSelection(interaction);
       } else if (interaction.customId.startsWith("mvr:character:")) {
         await handleCharacterSelection(interaction);
@@ -958,7 +1548,17 @@ async function handleInteraction(interaction: Interaction) {
     }
   } catch (error) {
     logger.error({ err: error }, "Discord interaction failed");
-    if (!interaction.isRepliable() || interaction.replied || interaction.deferred) return;
+    if (!interaction.isRepliable()) return;
+    if (interaction.deferred || interaction.replied) {
+      await interaction
+        .editReply({
+          content: "No pude completar el registro. Inténtalo otra vez.",
+          components: [],
+          embeds: [],
+        })
+        .catch(() => undefined);
+      return;
+    }
     await interaction.reply({
       content: "No pude completar el registro. Inténtalo otra vez.",
       ephemeral: true,
@@ -966,22 +1566,50 @@ async function handleInteraction(interaction: Interaction) {
   }
 }
 
+async function replyRoomClosedToMessage(message: Message) {
+  const closedReply = await message.reply(ROOM_CLOSED_MESSAGE);
+  scheduleMessageDeletion(closedReply);
+  await deleteTemporaryMessage(message);
+}
+
+async function handleExternalBotInterference(message: Message) {
+  if (!message.guildId || !isAuthorizedVoiceChannel(message.channelId)) return false;
+  if (!message.author.bot || message.author.id === client?.user?.id) return false;
+  if (isRoomOpen(message.guildId, message.channelId)) return false;
+
+  await deleteTemporaryMessage(message);
+  return true;
+}
+
 async function handleListCommand(message: Message) {
-  if (message.author.bot || message.content.trim().toLowerCase() !== "!list") {
+  if (message.author.bot || !isFarmRelatedMessageCommand(message.content)) {
     return;
   }
 
   if (!message.guildId) return;
 
   const member = message.member as GuildMember | null;
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    message.guildId,
+    message.channelId,
+    member,
+  );
+
+  if (!voiceChannelId || !isRoomOpen(message.guildId, voiceChannelId)) {
+    await replyRoomClosedToMessage(message);
+    return;
+  }
+
+  if (message.content.trim().toLowerCase() !== "!list") {
+    return;
+  }
+
   const voiceChannel =
     member?.voice.channel ??
     (message.channel.isVoiceBased() ? message.channel : null);
 
-  if (!voiceChannel) {
-    await message.reply(
-      "Debes estar dentro de un canal de voz para consultar su lista.",
-    );
+  if (!voiceChannel || voiceChannel.id !== voiceChannelId) {
+    await replyRoomClosedToMessage(message);
     return;
   }
 
@@ -996,55 +1624,65 @@ async function handleListCommand(message: Message) {
   await deleteTemporaryMessage(message);
 }
 
-async function registerChangeRoleCommand(applicationId: string) {
+async function handleMessageCreate(message: Message) {
+  if (await handleExternalBotInterference(message)) return;
+  await handleListCommand(message);
+}
+
+async function registerApplicationCommands(applicationId: string) {
   if (!client) return;
 
   try {
     const globalCommands = (await client.rest.get(
       Routes.applicationCommands(applicationId),
     )) as Array<{ id: string; name: string }>;
-    const existingGlobalCommand = globalCommands.find(
-      (command) => command.name === CHANGE_ROLE_COMMAND.name,
-    );
 
-    if (existingGlobalCommand) {
-      await client.rest.patch(
-        Routes.applicationCommand(applicationId, existingGlobalCommand.id),
-        { body: CHANGE_ROLE_COMMAND },
+    for (const command of APPLICATION_COMMANDS) {
+      const existingGlobalCommand = globalCommands.find(
+        (item) => item.name === command.name,
       );
-    } else {
-      await client.rest.post(Routes.applicationCommands(applicationId), {
-        body: CHANGE_ROLE_COMMAND,
-      });
+
+      if (existingGlobalCommand) {
+        await client.rest.patch(
+          Routes.applicationCommand(applicationId, existingGlobalCommand.id),
+          { body: command },
+        );
+      } else {
+        await client.rest.post(Routes.applicationCommands(applicationId), {
+          body: command,
+        });
+      }
     }
 
     logger.info(
       {
         applicationId,
-        commandName: CHANGE_ROLE_COMMAND.name,
+        commandNames: APPLICATION_COMMANDS.map((command) => command.name),
       },
-      "Global Discord application command registered",
+      "Global Discord application commands registered",
     );
   } catch (error) {
     logger.error(
       {
         err: error,
         applicationId,
-        commandName: CHANGE_ROLE_COMMAND.name,
+        commandNames: APPLICATION_COMMANDS.map((command) => command.name),
       },
-      "Could not register global /cambiar_rol command",
+      "Could not register global farm room commands",
     );
     return;
   }
 
+  const commandNames = APPLICATION_COMMANDS.map((command) => command.name);
   for (const guild of client.guilds.cache.values()) {
     try {
       const commands = await guild.commands.fetch();
-      const existingCommand = commands.find(
-        (command) => command.name === CHANGE_ROLE_COMMAND.name,
-      );
+      for (const commandName of commandNames) {
+        const existingCommand = commands.find(
+          (command) => command.name === commandName,
+        );
+        if (!existingCommand) continue;
 
-      if (existingCommand) {
         await guild.commands.delete(existingCommand.id);
         logger.info(
           {
@@ -1059,9 +1697,9 @@ async function registerChangeRoleCommand(applicationId: string) {
         {
           err: error,
           guildId: guild.id,
-          commandName: CHANGE_ROLE_COMMAND.name,
+          commandNames,
         },
-        "Could not remove guild-scoped duplicate of global Discord command",
+        "Could not remove guild-scoped duplicates of global Discord commands",
       );
     }
   }
@@ -1078,50 +1716,17 @@ async function handleVoiceStateUpdate(before: VoiceState, after: VoiceState) {
     if (registration?.voiceChannelId === before.channelId) {
       registrations.delete(key);
       pendingRegistrations.delete(key);
+    }
+    if (isAuthorizedVoiceChannel(before.channelId)) {
       await publishRosterForChannel(member.guild.id, before.channelId);
     }
   }
 
-  if (!after.channel || !changedChannel) return;
+  if (!after.channelId || !changedChannel) return;
+  if (!isAuthorizedVoiceChannel(after.channelId)) return;
+  if (!isRoomOpen(member.guild.id, after.channelId)) return;
 
-  const voiceChannel = after.channel;
-  const botMember = member.guild.members.me;
-  if (!botMember) {
-    logger.warn({ guildId: member.guild.id }, "Bot member is not available yet");
-    return;
-  }
-
-  const permissions = voiceChannel.permissionsFor(botMember);
-  if (
-    !permissions?.has(PermissionsBitField.Flags.ViewChannel) ||
-    !permissions.has(PermissionsBitField.Flags.SendMessages) ||
-    !permissions.has(PermissionsBitField.Flags.EmbedLinks)
-  ) {
-    logger.warn(
-      { channelId: voiceChannel.id },
-      "Bot lacks permissions to publish the registration panel",
-    );
-    return;
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle(`Bienvenido al farmeo, ${member.displayName}`)
-    .setDescription(
-      "Pulsa el botón para elegir tu rol, personaje e ID de juego de Marvel Rivals.",
-    );
-
-  const panelMessage = await voiceChannel.send({
-    content: `<@${member.id}>`,
-    embeds: [embed],
-    components: [buildRegistrationPanel()],
-  });
-  registrationPanelMessages.set(
-    pendingKey(member.guild.id, member.id),
-    panelMessage.id,
-  );
-  scheduleMessageDeletion(panelMessage, 10 * 60 * 1000);
-  await publishRosterForChannel(member.guild.id, voiceChannel.id);
+  await publishRosterForChannel(member.guild.id, after.channelId);
 }
 
 export function getDiscordBotStatus() {
@@ -1130,6 +1735,9 @@ export function getDiscordBotStatus() {
     username: botUsername ?? null,
     connectedAt: connectedAt ?? null,
     registrations: registrations.size,
+    openRooms: Array.from(roomStates.values()).filter(
+      (room) => room.status === "open",
+    ).length,
     error: lastDiscordError ?? null,
   };
 }
@@ -1171,10 +1779,10 @@ export async function startDiscordBot() {
     void syncCharacterEmojisAcrossGuilds([
       ...readyClient.guilds.cache.values(),
     ]);
-    void registerChangeRoleCommand(readyClient.user.id);
+    void registerApplicationCommands(readyClient.user.id);
   });
   client.on(Events.InteractionCreate, handleInteraction);
-  client.on(Events.MessageCreate, handleListCommand);
+  client.on(Events.MessageCreate, handleMessageCreate);
   client.on(Events.VoiceStateUpdate, handleVoiceStateUpdate);
   client.on(Events.GuildCreate, () => {
     if (!client || !connectedAt) return;
