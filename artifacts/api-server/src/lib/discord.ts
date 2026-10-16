@@ -445,26 +445,9 @@ function buildRegistrationPanel(sessionId: string, disabled = false) {
   );
 }
 
-function buildPublicRoleMenu(sessionId: string, disabled = false) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`mvr:roleopen:${sessionId}`)
-    .setPlaceholder("Elige tu rol: Vanguard, Duelist o Strategist")
-    .setDisabled(disabled)
-    .addOptions(
-      ROLE_OPTIONS.map((option) => ({
-        label: option.label,
-        value: option.value,
-        emoji: option.emoji,
-      })),
-    );
-
-  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-}
-
 function buildRoomComponents(sessionId: string, disabled = false) {
   return [
     buildRegistrationPanel(sessionId, disabled),
-    buildPublicRoleMenu(sessionId, disabled),
   ];
 }
 
