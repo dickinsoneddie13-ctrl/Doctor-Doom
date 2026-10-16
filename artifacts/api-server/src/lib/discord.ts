@@ -965,18 +965,17 @@ async function handleStartCommand(interaction: ChatInputCommandInteraction) {
   if (!context) return;
 
   const { guildId, channelId, member } = context;
-    const voiceChannelId = member?.voice?.channelId;
-  if (!voiceChannelId || !AUTHORIZED_VOICE_CHANNEL_IDS.has(voiceChannelId)) {
-    await interaction.reply({
-      content: "⚠️ Debes estar conectado dentro del canal de voz autorizado para iniciar o administrar la sala.",
-      ephemeral: true
-    });
-    return;
+const voiceChannelId = member?.voice?.channelId;
+if (!voiceChannelId || !AUTHORIZED_VOICE_CHANNEL_IDS.has(voiceChannelId)) {
+  const content = "⚠️ Debes estar conectado dentro del canal de voz autorizado para iniciar o administrar la sala.";
+  
+  if (interaction.replied || interaction.deferred) {
+    await interaction.followUp({ content, ephemeral: true });
+  } else {
+    await interaction.reply({ content, ephemeral: true });
   }
-  const previousRoom = getRoomState(guildId, channelId);
-  if (previousRoom.panelMessageId && previousRoom.sessionId) {
-    await invalidatePanelButtons(guildId, channelId, previousRoom.sessionId);
-  }
+  return;
+}
 
   clearChannelSessionData(guildId, channelId);
 
