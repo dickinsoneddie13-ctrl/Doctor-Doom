@@ -800,7 +800,6 @@ function buildOpenRoomEmbed(
     .setDescription(
       `Sala abierta por **${openedByUsername}**.\n` +
         "Pulsa el botón azul para registrarte: elige rol, personaje e ID de Marvel Rivals.\n\n" +
-        `Jugadores presentes en voz: **${voicePlayerCount}/${MAX_PLAYERS}**\n` +
         `Registros confirmados: **${registrationList.length}/${MAX_PLAYERS}**`,
     )
     .addFields(buildRoleFields(registrationList))
