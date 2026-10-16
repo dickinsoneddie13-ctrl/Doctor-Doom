@@ -8,7 +8,9 @@ import {
   Events,
   GatewayIntentBits,
   GuildMember,
+  MessageFlags,
   ModalBuilder,
+  PermissionFlagsBits,
   Routes,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
@@ -17,8 +19,11 @@ import {
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Guild,
+  type GuildBasedChannel,
   type Interaction,
   type Message,
+  type MessageCreateOptions,
+  type MessageEditOptions,
   type ModalSubmitInteraction,
   type StringSelectMenuInteraction,
   type VoiceState,
@@ -30,17 +35,17 @@ import { logger } from "./logger";
 
 const ROLE_OPTIONS = [
   {
-    label: "Vanguard (Tanque)",
+    label: "Tanque (Vanguard)",
     value: "Vanguard",
     emoji: { name: "vanguard2", id: "1552903419566497903" },
   },
   {
-    label: "Duelist (DPS)",
+    label: "Duelista (Duelist)",
     value: "Duelist",
     emoji: { name: "duelist2", id: "1552903434728906752" },
   },
   {
-    label: "Strategist (Soporte)",
+    label: "Healer (Strategist)",
     value: "Strategist",
     emoji: { name: "strategist2", id: "1552903394837143643" },
   },
@@ -48,6 +53,11 @@ const ROLE_OPTIONS = [
 
 const ROLE_ORDER = ["Vanguard", "Duelist", "Strategist"] as const;
 type CharacterRole = (typeof ROLE_ORDER)[number];
+const ROLE_FIELD_LABELS: Record<CharacterRole, string> = {
+  Vanguard: "Tanques",
+  Duelist: "Duelistas",
+  Strategist: "Healers",
+};
 
 type CharacterOption = {
   name: string;
@@ -251,6 +261,14 @@ const AUTHORIZED_CONTROL_ROLE_IDS = new Set([
 ]);
 const ROOM_CLOSED_MESSAGE =
   "La sala de farmeo está cerrada. Un usuario autorizado debe iniciar otra con /start.";
+const CLOSED_ROOM_COLOR = 0xff0000;
+const PANEL_CHANNEL_PERMISSIONS = [
+  PermissionFlagsBits.ViewChannel,
+  PermissionFlagsBits.SendMessages,
+  PermissionFlagsBits.EmbedLinks,
+  PermissionFlagsBits.ReadMessageHistory,
+] as const;
+const EPHEMERAL_FLAGS = MessageFlags.Ephemeral;
 const FARM_RELATED_MESSAGE_PATTERN =
   /^!(list|lista|register|registro|start|stop|rol|cambiar_rol|cambiar)\b/;
 
