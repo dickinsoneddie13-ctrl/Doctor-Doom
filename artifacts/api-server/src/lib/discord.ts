@@ -1607,7 +1607,7 @@ async function handleListCommand(message: Message) {
     return;
   }
 
-  if (message.content.trim().toLowerCase() !== "!list") {
+  if (message.content.trim().toLowerCase() !== "!lista") {
     return;
   }
 
