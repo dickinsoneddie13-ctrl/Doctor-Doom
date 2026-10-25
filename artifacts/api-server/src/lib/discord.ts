@@ -438,20 +438,6 @@ function isPendingValid(pending: PendingRegistration | undefined) {
   return Boolean(pending && Date.now() - pending.createdAt < 5 * 60 * 1000);
 }
 
-function buildRegistrationButton(sessionId: string, disabled = false) {
-  return new ButtonBuilder()
-    .setCustomId(`mvr:register:${sessionId}`)
-    .setLabel("Registrarme para la partida")
-    .setStyle(ButtonStyle.Primary)
-    .setDisabled(disabled);
-}
-
-function buildRegistrationPanel(sessionId: string, disabled = false) {
-  return new ActionRowBuilder<ButtonBuilder>().addComponents(
-    buildRegistrationButton(sessionId, disabled),
-  );
-}
-
 function buildPublicRoleMenu(sessionId: string, disabled = false) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`mvr:roleopen:${sessionId}`)
@@ -470,7 +456,6 @@ function buildPublicRoleMenu(sessionId: string, disabled = false) {
 
 function buildRoomComponents(sessionId: string, disabled = false) {
   return [
-    buildRegistrationPanel(sessionId, disabled),
     buildPublicRoleMenu(sessionId, disabled),
   ];
 }
@@ -823,7 +808,7 @@ function buildOpenRoomEmbed(
     .setTitle("Bienvenido al farmeo")
     .setDescription(
       `Sala abierta por **${openedByUsername}**.\n` +
-        "Pulsa el botón azul para registrarte: elige rol, personaje e ID de Marvel Rivals.\n\n" +
+        "Selecciona tu rol en el menú desplegable de abajo para registrarte.\n\n" +
         `Jugadores presentes en voz: **${voicePlayerCount}/${MAX_PLAYERS}**\n` +
         `Registros confirmados: **${registrationList.length}/${MAX_PLAYERS}**`,
     )
@@ -1099,80 +1084,6 @@ function resolveFarmVoiceChannelId(
   return undefined;
 }
 
-async function handleButtonInteraction(interaction: ButtonInteraction) {
-  const [prefix, type, sessionId] = interaction.customId.split(":");
-  if (prefix !== "mvr" || type !== "register") return;
-
-  await deferEphemeral(interaction);
-
-  const guildId = interaction.guildId;
-  if (!guildId) {
-    await replyEphemeral(
-      interaction,
-      "Este registro solo está disponible dentro de un servidor.",
-    );
-    return;
-  }
-
-  const member = await resolveGuildMember(interaction);
-  const voiceChannelId = resolveFarmVoiceChannelId(
-    guildId,
-    interaction.channelId,
-    member,
-  );
-
-  if (
-    !voiceChannelId ||
-    !isRoomOpen(guildId, voiceChannelId) ||
-    !isActiveSession(guildId, voiceChannelId, sessionId)
-  ) {
-    await invalidatePanelButtons(
-      guildId,
-      interaction.channelId,
-      sessionId || "closed",
-    );
-    await rejectClosedRoom(interaction);
-    return;
-  }
-
-  const existingRegistration = registrations.get(
-    registrationKey(guildId, interaction.user.id),
-  );
-  if (existingRegistration) {
-    await replyEphemeral(
-      interaction,
-      `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}** ` +
-        `con el ID **${existingRegistration.gameId}**.\n\n` +
-        "No puedes registrarte otra vez. Si necesitas cambiarlo, usa `/cambiar_rol`.",
-    );
-    return;
-  }
-
-  const voiceChannel = member?.voice.channel;
-  if (!voiceChannel || voiceChannel.id !== voiceChannelId) {
-    await replyEphemeral(
-      interaction,
-      "Debes estar dentro de este canal de voz para registrarte.",
-    );
-    return;
-  }
-
-  if (
-    getChannelRegistrations(guildId, voiceChannel.id).length >= MAX_PLAYERS
-  ) {
-    await replyEphemeral(
-      interaction,
-      `Este canal ya está lleno: **${MAX_PLAYERS}/${MAX_PLAYERS}** jugadores.`,
-    );
-    return;
-  }
-
-  await interaction.editReply({
-    content: "Primero selecciona el rol que vas a jugar:",
-    components: [buildRoleMenu(interaction.user.id, "register")],
-  });
-}
-
 async function handlePublicRoleSelection(interaction: StringSelectMenuInteraction) {
   const [prefix, type, sessionId] = interaction.customId.split(":");
   if (prefix !== "mvr" || type !== "roleopen") return;
@@ -1307,7 +1218,6 @@ async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
   const role = interaction.values[0];
   if (!role) return;
 
-  // VALIDACIÓN DE LÍMITE DE 4 POR ROL (A menos que sea cambio propio y libere el mismo)
   const currentRoleCount = getRoleCount(guildId, voiceChannelId, role);
   if (mode !== "change" && currentRoleCount >= MAX_PLAYERS_PER_ROLE) {
     await interaction.followUp({
@@ -1365,7 +1275,7 @@ async function handleChangeRoleCommand(
   if (!registration) {
     await replyEphemeral(
       interaction,
-      "Todavía no tienes un registro. Pulsa el botón de registro de la sala abierta.",
+      "Todavía no tienes un registro. Selecciona tu rol en el menú desplegable de la sala abierta.",
     );
     return;
   }
@@ -1399,7 +1309,7 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
 
   if (interaction.user.id !== userId) {
     await interaction.reply({
-      content: "Este registro pertenece a otra persona. Pulsa el botón para iniciar el tuyo.",
+      content: "Este registro pertenece a otra persona.",
       ephemeral: true,
     });
     return;
@@ -1422,7 +1332,7 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
   );
   if (!isPendingValid(pending)) {
     await interaction.update({
-      content: "Tu selección expiró. Pulsa el botón de registro para comenzar de nuevo.",
+      content: "Tu selección expiró. Selecciona tu rol en el menú desplegable para comenzar de nuevo.",
       components: [],
     });
     return;
@@ -1431,7 +1341,6 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
   const character = interaction.values[0];
   if (!character || !pending) return;
 
-  // Doble verificación del límite por rol antes de finalizar
   const currentRoleCount = getRoleCount(guildId, voiceChannelId, pending.role);
   if (pending.mode !== "change" && currentRoleCount >= MAX_PLAYERS_PER_ROLE) {
     await interaction.update({
@@ -1448,7 +1357,7 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
     if (!existingRegistration) {
       await interaction.update({
         content:
-          "No tienes un registro activo. Pulsa el botón de registro para comenzar.",
+          "No tienes un registro activo. Selecciona tu rol en el menú para comenzar.",
         components: [],
       });
       return;
@@ -1535,7 +1444,6 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
   const role = decodeURIComponent(encodedRole);
   const character = decodeURIComponent(encodedCharacter);
 
-  // VALIDACIÓN ESTRICTA FINAL AL ENVIAR EL MODAL
   const currentRoleCount = getRoleCount(guildId, voiceChannelId, role);
   if (currentRoleCount >= MAX_PLAYERS_PER_ROLE) {
     pendingRegistrations.delete(pendingKey(guildId, userId));
@@ -1601,8 +1509,6 @@ async function handleInteraction(interaction: Interaction) {
         await handleChangeRoleCommand(interaction);
         return;
       }
-    } else if (interaction.isButton()) {
-      await handleButtonInteraction(interaction);
     } else if (interaction.isStringSelectMenu()) {
       if (interaction.customId.startsWith("mvr:roleopen:")) {
         await handlePublicRoleSelection(interaction);
@@ -1775,7 +1681,7 @@ async function registerApplicationCommands(applicationId: string) {
 
 async function handleVoiceStateUpdate(before: VoiceState, after: VoiceState) {
   const member = after.member ?? before.member;
-  if (!member || member.user.bot) return; // Ignorar si es un bot
+  if (!member || member.user.bot) return;
 
   const guildId = member.guild.id;
   const changedChannel = before.channelId !== after.channelId;
@@ -1800,29 +1706,21 @@ async function handleVoiceStateUpdate(before: VoiceState, after: VoiceState) {
 
   await publishRosterForChannel(guildId, voiceChannelId);
 
-  // VERIFICAR SI LA SALA YA ESTÁ LLENA (12/12)
   const registrationList = getChannelRegistrations(guildId, voiceChannelId);
-  if (registrationList.length >= MAX_PLAYERS) return; // Si está llena, no spamear alerta a la persona 13
+  if (registrationList.length >= MAX_PLAYERS) return;
 
   const userId = member.id;
   const isRegistered = registrations.has(registrationKey(guildId, userId));
 
-  // SI NO ESTÁ REGISTRADO Y LA SALA NO ESTÁ LLENA, ENVIAR ALERTA CON BOTÓN
   if (!isRegistered) {
     const room = getRoomState(guildId, voiceChannelId);
     const channel = client?.channels.cache.get(voiceChannelId);
     if (channel && channel.isTextBased() && channel.isSendable() && room.sessionId) {
-      const registerButton = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`mvr:register:${room.sessionId}`)
-          .setLabel("Registrarme aquí")
-          .setStyle(ButtonStyle.Primary)
-          .setEmoji("✍️")
-      );
+      const roleMenu = buildPublicRoleMenu(room.sessionId);
 
       await channel.send({
-        content: `⚠️ ${member}, estás en el canal de voz de farmeo pero aún no te has registrado. Presiona el botón de abajo para hacerlo directamente:`,
-        components: [registerButton],
+        content: `⚠️ ${member}, estás en el canal de voz de farmeo pero aún no te has registrado. Selecciona tu rol en el menú de abajo para hacerlo directamente:`,
+        components: [roleMenu],
       });
     }
   }
@@ -1853,7 +1751,7 @@ export async function startDiscordBot() {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.GuildVoiceStates,
+      GatewayIntentBits.GatewayIntentBits.GuildVoiceStates,
       GatewayIntentBits.MessageContent,
     ],
   });
