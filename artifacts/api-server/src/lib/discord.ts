@@ -1714,26 +1714,60 @@ async function registerApplicationCommands(applicationId: string) {
 
 async function handleVoiceStateUpdate(before: VoiceState, after: VoiceState) {
   const member = after.member ?? before.member;
-  if (!member) return;
+  if (!member || member.user.bot) return; // Ignorar si es un bot
 
+  const guildId = member.guild.id;
   const changedChannel = before.channelId !== after.channelId;
+
+  // 1. Si el usuario sale del canal de voz
   if (before.channelId && changedChannel) {
-    const key = registrationKey(member.guild.id, member.id);
+    const key = registrationKey(guildId, member.id);
     const registration = registrations.get(key);
     if (registration?.voiceChannelId === before.channelId) {
       registrations.delete(key);
       pendingRegistrations.delete(key);
     }
     if (isAuthorizedVoiceChannel(before.channelId)) {
-      await publishRosterForChannel(member.guild.id, before.channelId);
+      await publishRosterForChannel(guildId, before.channelId);
     }
   }
 
+  // 2. Si el usuario entra o cambia a un nuevo canal de voz
   if (!after.channelId || !changedChannel) return;
-  if (!isAuthorizedVoiceChannel(after.channelId)) return;
-  if (!isRoomOpen(member.guild.id, after.channelId)) return;
+  const voiceChannelId = after.channelId;
+  
+  if (!isAuthorizedVoiceChannel(voiceChannelId)) return;
+  
+  // Verificar si la sala de farmeo está abierta en este canal
+  const room = getRoomState(guildId, voiceChannelId);
+  if (room.status !== "open" || !room.sessionId) return;
 
-  await publishRosterForChannel(member.guild.id, after.channelId);
+  // Actualizar el panel principal de voz
+  await publishRosterForChannel(guildId, voiceChannelId);
+
+  // 3. Verificar si el usuario YA está registrado en esta sesión
+  const userId = member.id;
+  const isRegistered = registrations.has(registrationKey(guildId, userId));
+
+  // 4. Si NO está registrado, enviar el recordatorio con botón integrado
+  if (!isRegistered) {
+    const channel = client?.channels.cache.get(voiceChannelId);
+    if (channel && channel.isTextBased() && channel.isSendable()) {
+      // Crear un botón directo para este aviso
+      const registerButton = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mvr:register:${room.sessionId}`) // Mismo ID para abrir el registro
+          .setLabel("Registrarme aquí")
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji("✍️")
+      );
+
+      await channel.send({
+        content: `⚠️ ${member}, estás en el canal de voz de farmeo pero aún no te has registrado. Presiona el botón de abajo para hacerlo directamente:`,
+        components: [registerButton],
+      });
+    }
+  }
 }
 
 export function getDiscordBotStatus() {
