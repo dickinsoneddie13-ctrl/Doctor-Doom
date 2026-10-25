@@ -1751,7 +1751,7 @@ export async function startDiscordBot() {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.GatewayIntentBits.GuildVoiceStates,
+      GatewayIntentBits.GuildVoiceStates,
       GatewayIntentBits.MessageContent,
     ],
   });
