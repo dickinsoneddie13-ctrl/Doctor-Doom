@@ -471,7 +471,6 @@ function buildPublicRoleMenu(sessionId: string, disabled = false) {
 function buildRoomComponents(sessionId: string, disabled = false) {
   return [
     buildRegistrationPanel(sessionId, disabled),
-    buildPublicRoleMenu(sessionId, disabled),
   ];
 }
 
