@@ -456,6 +456,7 @@ function buildPublicRoleMenu(sessionId: string, disabled = false) {
 
 function buildRoomComponents(sessionId: string, disabled = false) {
   return [
+    buildRegistrationPanel(sessionId, disabled),
     buildPublicRoleMenu(sessionId, disabled),
   ];
 }
@@ -1713,18 +1714,16 @@ async function handleVoiceStateUpdate(before: VoiceState, after: VoiceState) {
   const isRegistered = registrations.has(registrationKey(guildId, userId));
 
   if (!isRegistered) {
-    const room = getRoomState(guildId, voiceChannelId);
-    const channel = client?.channels.cache.get(voiceChannelId);
-    if (channel && channel.isTextBased() && channel.isSendable() && room.sessionId) {
-      const roleMenu = buildPublicRoleMenu(room.sessionId);
-
-      await channel.send({
-        content: `⚠️ ${member}, estás en el canal de voz de farmeo pero aún no te has registrado. Selecciona tu rol en el menú de abajo para hacerlo directamente:`,
-        components: [roleMenu],
-      });
-    }
-  }
-}
+      const channel = client?.channels.cache.get(voiceChannelId);
+      if (channel && channel.isTextBased() && channel.isSendable()) {
+        // Crear un botón directo para este aviso
+        const registerButton = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`mvr:register:${room.sessionId}`) // Mismo ID para abrir el registro
+            .setLabel("Registrarme aquí")
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji("✍️")
+          );
 
 export function getDiscordBotStatus() {
   return {
