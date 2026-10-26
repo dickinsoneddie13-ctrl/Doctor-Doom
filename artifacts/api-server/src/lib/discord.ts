@@ -438,6 +438,20 @@ function isPendingValid(pending: PendingRegistration | undefined) {
   return Boolean(pending && Date.now() - pending.createdAt < 5 * 60 * 1000);
 }
 
+function buildRegistrationButton(sessionId: string, disabled = false) {
+  return new ButtonBuilder()
+    .setCustomId(`mvr:register:${sessionId}`)
+    .setLabel("Registrarme para la partida")
+    .setStyle(ButtonStyle.Primary)
+    .setDisabled(disabled);
+}
+
+function buildRegistrationPanel(sessionId: string, disabled = false) {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    buildRegistrationButton(sessionId, disabled),
+  );
+}
+
 function buildPublicRoleMenu(sessionId: string, disabled = false) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`mvr:roleopen:${sessionId}`)
@@ -456,6 +470,7 @@ function buildPublicRoleMenu(sessionId: string, disabled = false) {
 
 function buildRoomComponents(sessionId: string, disabled = false) {
   return [
+    buildRegistrationPanel(sessionId, disabled),
     buildPublicRoleMenu(sessionId, disabled),
   ];
 }
@@ -808,7 +823,7 @@ function buildOpenRoomEmbed(
     .setTitle("Bienvenido al farmeo")
     .setDescription(
       `Sala abierta por **${openedByUsername}**.\n` +
-        "Selecciona tu rol en el menú desplegable de abajo para registrarte.\n\n" +
+        "Pulsa el botón azul para registrarte: elige rol, personaje e ID de Marvel Rivals.\n\n" +
         `Jugadores presentes en voz: **${voicePlayerCount}/${MAX_PLAYERS}**\n` +
         `Registros confirmados: **${registrationList.length}/${MAX_PLAYERS}**`,
     )
@@ -1071,6 +1086,80 @@ async function handleStopCommand(interaction: ChatInputCommandInteraction) {
   await replyEphemeral(interaction, "Sala de farmeo cerrada. Ya no se aceptan registros.");
 }
 
+async function handleButtonInteraction(interaction: ButtonInteraction) {
+  const [prefix, type, sessionId] = interaction.customId.split(":");
+  if (prefix !== "mvr" || type !== "register") return;
+
+  await deferEphemeral(interaction);
+
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await replyEphemeral(
+      interaction,
+      "Este registro solo está disponible dentro de un servidor.",
+    );
+    return;
+  }
+
+  const member = await resolveGuildMember(interaction);
+  const voiceChannelId = resolveFarmVoiceChannelId(
+    guildId,
+    interaction.channelId,
+    member,
+  );
+
+  if (
+    !voiceChannelId ||
+    !isRoomOpen(guildId, voiceChannelId) ||
+    !isActiveSession(guildId, voiceChannelId, sessionId)
+  ) {
+    await invalidatePanelButtons(
+      guildId,
+      interaction.channelId,
+      sessionId || "closed",
+    );
+    await rejectClosedRoom(interaction);
+    return;
+  }
+
+  const existingRegistration = registrations.get(
+    registrationKey(guildId, interaction.user.id),
+  );
+  if (existingRegistration) {
+    await replyEphemeral(
+      interaction,
+      `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}** ` +
+        `con el ID **${existingRegistration.gameId}**.\n\n` +
+        "No puedes registrarte otra vez. Si necesitas cambiarlo, usa `/cambiar_rol`.",
+    );
+    return;
+  }
+
+  const voiceChannel = member?.voice.channel;
+  if (!voiceChannel || voiceChannel.id !== voiceChannelId) {
+    await replyEphemeral(
+      interaction,
+      "Debes estar dentro de este canal de voz para registrarte.",
+    );
+    return;
+  }
+
+  if (
+    getChannelRegistrations(guildId, voiceChannel.id).length >= MAX_PLAYERS
+  ) {
+    await replyEphemeral(
+      interaction,
+      `Este canal ya está lleno: **${MAX_PLAYERS}/${MAX_PLAYERS}** jugadores.`,
+    );
+    return;
+  }
+
+  await interaction.editReply({
+    content: "Primero selecciona el rol que vas a jugar:",
+    components: [buildRoleMenu(interaction.user.id, "register")],
+  });
+}
+
 function resolveFarmVoiceChannelId(
   guildId: string,
   channelId: string | null | undefined,
@@ -1274,7 +1363,7 @@ async function handleChangeRoleCommand(
   if (!registration) {
     await replyEphemeral(
       interaction,
-      "Todavía no tienes un registro. Selecciona tu rol en el menú desplegable de la sala abierta.",
+      "Todavía no tienes un registro. Pulsa el botón de registro de la sala abierta.",
     );
     return;
   }
@@ -1331,7 +1420,7 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
   );
   if (!isPendingValid(pending)) {
     await interaction.update({
-      content: "Tu selección expiró. Selecciona tu rol en el menú desplegable para comenzar de nuevo.",
+      content: "Tu selección expiró. Pulsa el botón de registro para comenzar de nuevo.",
       components: [],
     });
     return;
@@ -1356,7 +1445,7 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
     if (!existingRegistration) {
       await interaction.update({
         content:
-          "No tienes un registro activo. Selecciona tu rol en el menú para comenzar.",
+          "No tienes un registro activo. Pulsa el botón de registro para comenzar.",
         components: [],
       });
       return;
@@ -1508,6 +1597,8 @@ async function handleInteraction(interaction: Interaction) {
         await handleChangeRoleCommand(interaction);
         return;
       }
+    } else if (interaction.isButton()) {
+      await handleButtonInteraction(interaction);
     } else if (interaction.isStringSelectMenu()) {
       if (interaction.customId.startsWith("mvr:roleopen:")) {
         await handlePublicRoleSelection(interaction);
@@ -1715,11 +1806,17 @@ async function handleVoiceStateUpdate(before: VoiceState, after: VoiceState) {
     const room = getRoomState(guildId, voiceChannelId);
     const channel = client?.channels.cache.get(voiceChannelId);
     if (channel && channel.isTextBased() && channel.isSendable() && room.sessionId) {
-      const roleMenu = buildPublicRoleMenu(room.sessionId);
+      const registerButton = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mvr:register:${room.sessionId}`)
+          .setLabel("Registrarme aquí")
+          .setStyle(ButtonStyle.Primary)
+          .setEmoji("✍️")
+      );
 
       await channel.send({
-        content: `⚠️ ${member}, estás en el canal de voz de farmeo pero aún no te has registrado. Selecciona tu rol en el menú de abajo para hacerlo directamente:`,
-        components: [roleMenu],
+        content: `⚠️ ${member}, estás en el canal de voz de farmeo pero aún no te has registrado. Presiona el botón de abajo para hacerlo directamente:`,
+        components: [registerButton],
       });
     }
   }
@@ -1795,4 +1892,4 @@ export async function startDiscordBot() {
       error instanceof Error ? error.message : "Discord login failed.";
     logger.error({ err: error }, "Discord bot could not connect");
   }
-}  
+}
