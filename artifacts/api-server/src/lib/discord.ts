@@ -456,7 +456,6 @@ function buildPublicRoleMenu(sessionId: string, disabled = false) {
 
 function buildRoomComponents(sessionId: string, disabled = false) {
   return [
-    buildRegistrationPanel(sessionId, disabled),
     buildPublicRoleMenu(sessionId, disabled),
   ];
 }
@@ -1156,7 +1155,6 @@ async function handlePublicRoleSelection(interaction: StringSelectMenuInteractio
     return;
   }
 
-  // VALIDACIÓN DE LÍMITE DE 4 POR ROL
   const currentRoleCount = getRoleCount(guildId, voiceChannelId, role);
   if (currentRoleCount >= MAX_PLAYERS_PER_ROLE) {
     await replyEphemeral(
@@ -1196,7 +1194,7 @@ async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
 
   if (interaction.user.id !== userId) {
     await interaction.reply({
-      content: "Este registro pertenece a otra persona. Pulsa el botón para iniciar el tuyo.",
+      content: "Este registro pertenece a otra persona.",
       ephemeral: true,
     });
     return;
@@ -1714,16 +1712,18 @@ async function handleVoiceStateUpdate(before: VoiceState, after: VoiceState) {
   const isRegistered = registrations.has(registrationKey(guildId, userId));
 
   if (!isRegistered) {
-      const channel = client?.channels.cache.get(voiceChannelId);
-      if (channel && channel.isTextBased() && channel.isSendable()) {
-        // Crear un botón directo para este aviso
-        const registerButton = new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder()
-            .setCustomId(`mvr:register:${room.sessionId}`) // Mismo ID para abrir el registro
-            .setLabel("Registrarme aquí")
-            .setStyle(ButtonStyle.Primary)
-            .setEmoji("✍️")
-          );
+    const room = getRoomState(guildId, voiceChannelId);
+    const channel = client?.channels.cache.get(voiceChannelId);
+    if (channel && channel.isTextBased() && channel.isSendable() && room.sessionId) {
+      const roleMenu = buildPublicRoleMenu(room.sessionId);
+
+      await channel.send({
+        content: `⚠️ ${member}, estás en el canal de voz de farmeo pero aún no te has registrado. Selecciona tu rol en el menú de abajo para hacerlo directamente:`,
+        components: [roleMenu],
+      });
+    }
+  }
+}
 
 export function getDiscordBotStatus() {
   return {
@@ -1795,5 +1795,4 @@ export async function startDiscordBot() {
       error instanceof Error ? error.message : "Discord login failed.";
     logger.error({ err: error }, "Discord bot could not connect");
   }
-} // <-- Esta llave cierra startDiscordBot()
-  
+}  
