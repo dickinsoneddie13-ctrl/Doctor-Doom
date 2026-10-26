@@ -1795,4 +1795,5 @@ export async function startDiscordBot() {
       error instanceof Error ? error.message : "Discord login failed.";
     logger.error({ err: error }, "Discord bot could not connect");
   }
-}
+} // <-- Esta llave cierra startDiscordBot()
+  
