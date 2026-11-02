@@ -271,7 +271,7 @@ const PANEL_CHANNEL_PERMISSIONS = [
 ] as const;
 const EPHEMERAL_FLAGS = MessageFlags.Ephemeral;
 const FARM_RELATED_MESSAGE_PATTERN =
-  /^!(list|lista|register|registro|start|stop|rol|cambiar_rol|cambiar)\b/;
+  /^!(lista|register|registro|start|stop|rol|cambiar_rol|cambiar|noafk)\b/;
 
 const START_COMMAND = new SlashCommandBuilder()
   .setName("start")
@@ -285,7 +285,11 @@ const CHANGE_ROLE_COMMAND = new SlashCommandBuilder()
   .setName("cambiar_rol")
   .setDescription("Cambia tu rol y personaje después de registrarte")
   .toJSON();
-const APPLICATION_COMMANDS = [START_COMMAND, STOP_COMMAND, CHANGE_ROLE_COMMAND];
+const NO_AFK_COMMAND = new SlashCommandBuilder()
+  .setName("noafk")
+  .setDescription("Muestra los métodos para evitar la desconexión por inactividad (AFK)")
+  .toJSON();
+const APPLICATION_COMMANDS = [START_COMMAND, STOP_COMMAND, CHANGE_ROLE_COMMAND, NO_AFK_COMMAND];
 
 type PendingRegistration = {
   role: string;
@@ -469,6 +473,13 @@ function buildNoAfkEmbed() {
     )
     .setColor(0xED4245)
     .setFooter({ text: "Desconectarte de un farmeo te dará un warn, ticket por el host y si acumulas 3 warns, serás baneado" });
+}
+
+async function handleNoAfkCommand(message: Message) {
+  if (message.author.bot || message.content.trim().toLowerCase() !== "!noafk") {
+    return;
+  }
+  await message.reply({ embeds: [buildNoAfkEmbed()] });
 }
 
 function buildPublicRoleMenu(sessionId: string, disabled = false) {
