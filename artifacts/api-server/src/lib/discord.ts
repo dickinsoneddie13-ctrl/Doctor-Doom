@@ -456,12 +456,6 @@ function buildRegistrationPanel(sessionId: string, disabled = false) {
   );
 }
 
-function buildRoomComponents(sessionId: string, disabled = false) {
-  return [
-    buildRegistrationPanel(sessionId, disabled),
-  ];
-}
-
 function buildNoAfkEmbed() {
   return new EmbedBuilder()
     .setTitle("Métodos para no desconectarte (AFK)")
