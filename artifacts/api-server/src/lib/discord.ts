@@ -1627,7 +1627,8 @@ async function handleInteraction(interaction: Interaction) {
         return;
       }
       if (interaction.commandName === "noafk") {
-        await handleListCommand(interaction);
+        await interaction.deferReply();
+        await interaction.editReply({ embeds: [buildNoAfkEmbed()] });
         return;
       }
     } else if (interaction.isButton()) {
