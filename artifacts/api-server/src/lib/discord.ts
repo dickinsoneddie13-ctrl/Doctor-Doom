@@ -452,6 +452,25 @@ function buildRegistrationPanel(sessionId: string, disabled = false) {
   );
 }
 
+function buildRoomComponents(sessionId: string, disabled = false) {
+  return [
+    buildRegistrationPanel(sessionId, disabled),
+  ];
+}
+
+function buildNoAfkEmbed() {
+  return new EmbedBuilder()
+    .setTitle("Métodos para no desconectarte (AFK)")
+    .setDescription(
+      "Aquí hay algunos métodos para no ser desconectado por inactividad:\n\n" +
+      "**PC:** Descarga un **autoclicker** y ejecútalo como administrador, de lo contrario no funcionará.\n\n" +
+      "**PlayStation:** Mantén presionado el botón que quieras pulsar continuamente (como R2) y presiona el logo de PlayStation en tu mando al mismo tiempo.\n\n" +
+      "**XBOX:** Apoya el mando sobre sus gatillos para simular el input, o puedes usar ligas elásticas (rubber bands)."
+    )
+    .setColor(0xED4245)
+    .setFooter({ text: "Desconectarte de un farmeo te dará un warn, ticket por el host y si acumulas 3 warns, serás baneado" });
+}
+
 function buildPublicRoleMenu(sessionId: string, disabled = false) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`mvr:roleopen:${sessionId}`)
@@ -1596,6 +1615,10 @@ async function handleInteraction(interaction: Interaction) {
         await handleChangeRoleCommand(interaction);
         return;
       }
+      if (interaction.commandName === "noafk") {
+        await handleListCommand(interaction);
+        return;
+      }
     } else if (interaction.isButton()) {
       await handleButtonInteraction(interaction);
     } else if (interaction.isStringSelectMenu()) {
@@ -1663,7 +1686,7 @@ async function handleListCommand(message: Message) {
     return;
   }
 
-  if (message.content.trim().toLowerCase() !== "!list") {
+  if (message.content.trim().toLowerCase() !== "!lista") {
     return;
   }
 
@@ -1690,6 +1713,7 @@ async function handleListCommand(message: Message) {
 async function handleMessageCreate(message: Message) {
   if (await handleExternalBotInterference(message)) return;
   await handleListCommand(message);
+  await handleNoAfkCommand(message);
 }
 
 async function registerApplicationCommands(applicationId: string) {
