@@ -456,6 +456,12 @@ function buildRegistrationPanel(sessionId: string, disabled = false) {
   );
 }
 
+function buildRoomComponents(sessionId: string, disabled = false) {
+  return [
+    buildRegistrationPanel(sessionId, disabled),
+  ];
+}
+
 function buildNoAfkEmbed() {
   return new EmbedBuilder()
     .setTitle("Métodos para no desconectarte (AFK)")
@@ -470,10 +476,12 @@ function buildNoAfkEmbed() {
 }
 
 async function handleNoAfkCommand(message: Message) {
-  if (message.author.bot || message.content.trim().toLowerCase() !== "!noafk") {
-    return;
+  if (message.author.bot) return;
+  const content = message.content.trim().toLowerCase();
+  
+  if (content === "!noafk") {
+    await message.reply({ embeds: [buildNoAfkEmbed()] });
   }
-  await message.reply({ embeds: [buildNoAfkEmbed()] });
 }
 
 function buildPublicRoleMenu(sessionId: string, disabled = false) {
@@ -490,12 +498,6 @@ function buildPublicRoleMenu(sessionId: string, disabled = false) {
     );
 
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu);
-}
-
-function buildRoomComponents(sessionId: string, disabled = false) {
-  return [
-    buildRegistrationPanel(sessionId, disabled),
-  ];
 }
 
 async function replyEphemeral(
