@@ -409,6 +409,75 @@ function isPendingValid(pending: PendingRegistration | undefined) {
   return Boolean(pending && Date.now() - pending.createdAt < 5 * 60 * 1000);
 }
 
+function isUnknownInteractionError(error: unknown) {
+  if (!error || typeof error !== "object") return false;
+
+  const code = "code" in error ? error.code : undefined;
+  const message =
+    "message" in error && typeof error.message === "string"
+      ? error.message
+      : "";
+
+  return code === 10062 || code === "10062" || /unknown interaction/i.test(message);
+}
+
+async function handleInteractionError(
+  interaction: Interaction,
+  handlerName: string,
+  error: unknown,
+) {
+  if (isUnknownInteractionError(error)) {
+    logger.debug(
+      { err: error, interactionId: interaction.id, handlerName },
+      "Discord interaction expired before it could be handled",
+    );
+    return;
+  }
+
+  logger.error(
+    { err: error, interactionId: interaction.id, handlerName },
+    "Discord interaction handler failed",
+  );
+  if (!interaction.isRepliable()) return;
+
+  try {
+    if (interaction.deferred) {
+      await interaction.editReply({
+        content: "No pude completar esta acción. Inténtalo otra vez.",
+      });
+    } else if (!interaction.replied) {
+      await interaction.reply({
+        content: "No pude completar esta acción. Inténtalo otra vez.",
+        ephemeral: true,
+      });
+    }
+  } catch (replyError) {
+    if (isUnknownInteractionError(replyError)) {
+      logger.debug(
+        { err: replyError, interactionId: interaction.id, handlerName },
+        "Discord interaction expired before the error response could be sent",
+      );
+      return;
+    }
+    logger.warn(
+      { err: replyError, interactionId: interaction.id, handlerName },
+      "Could not send Discord interaction error response",
+    );
+  }
+}
+
+async function runInteractionHandler(
+  interaction: Interaction,
+  handlerName: string,
+  handler: () => Promise<void>,
+) {
+  try {
+    await handler();
+  } catch (error) {
+    await handleInteractionError(interaction, handlerName, error);
+  }
+}
+
 function buildRegistrationPanel(voiceChannelId: string) {
   const button = new ButtonBuilder()
     .setCustomId(`mvr:session-register:${voiceChannelId}`)
@@ -961,9 +1030,8 @@ async function beginRegistration(
 ) {
   const guildId = interaction.guildId;
   if (!guildId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este registro solo está disponible dentro de un servidor.",
-      ephemeral: true,
     });
     return false;
   }
@@ -972,9 +1040,8 @@ async function beginRegistration(
       farmingSessionKey(guildId, expectedVoiceChannelId),
     )
   ) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "La sala de farmeo se encuentra cerrada.",
-      ephemeral: true,
     });
     return false;
   }
@@ -983,43 +1050,38 @@ async function beginRegistration(
     registrationKey(guildId, interaction.user.id),
   );
   if (existingRegistration) {
-    await interaction.reply({
+    await interaction.editReply({
       content:
         `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}** ` +
         `con el ID **${existingRegistration.gameId}**.\n\n` +
         "No puedes registrarte otra vez. Si necesitas cambiarlo, usa `/cambiar_rol`.",
-      ephemeral: true,
     });
     return false;
   }
 
   const member = await getGuildMember(guildId, interaction.user.id);
   if (!hasAuthorizedRole(member)) {
-    await interaction.reply({
+    await interaction.editReply({
       content: ACCESS_DENIED_MESSAGE,
-      ephemeral: true,
     });
     return false;
   }
   const voiceChannel = member?.voice.channel;
   if (!voiceChannel) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar dentro de un canal de voz para registrarte.",
-      ephemeral: true,
     });
     return false;
   }
   if (voiceChannel.id !== expectedVoiceChannelId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar en el canal de voz vinculado a esta sala.",
-      ephemeral: true,
     });
     return false;
   }
   if (!isAllowedChannel(voiceChannel.id)) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar en un canal de voz permitido para registrarte.",
-      ephemeral: true,
     });
     return false;
   }
@@ -1030,19 +1092,17 @@ async function beginRegistration(
     interaction.user.id,
   );
   if (!capacity.available) {
-    await interaction.reply({
+    await interaction.editReply({
       content: `Este canal ya está lleno: **${capacity.playerCount}/${MAX_PLAYERS}** jugadores.`,
-      ephemeral: true,
     });
     return false;
   }
 
-  await interaction.reply({
+  await interaction.editReply({
     content: "Primero selecciona el rol que vas a jugar:",
     components: [
       buildRoleMenu(interaction.user.id, "register", voiceChannel.id),
     ],
-    ephemeral: true,
   });
   return true;
 }
@@ -1050,33 +1110,29 @@ async function beginRegistration(
 async function handleStartCommand(interaction: ChatInputCommandInteraction) {
   const guildId = interaction.guildId;
   if (!guildId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este comando solo funciona dentro de un servidor.",
-      ephemeral: true,
     });
     return;
   }
 
   const member = await getGuildMember(guildId, interaction.user.id);
   if (!hasAuthorizedRole(member)) {
-    await interaction.reply({
+    await interaction.editReply({
       content: ACCESS_DENIED_MESSAGE,
-      ephemeral: true,
     });
     return;
   }
   const voiceChannel = member?.voice.channel;
   if (!voiceChannel) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar dentro de un canal de voz para abrir la sala.",
-      ephemeral: true,
     });
     return;
   }
   if (!isAllowedChannel(voiceChannel.id)) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar en un canal de voz permitido para abrir la sala.",
-      ephemeral: true,
     });
     return;
   }
@@ -1085,9 +1141,8 @@ async function handleStartCommand(interaction: ChatInputCommandInteraction) {
   const existingSession = farmingSessions.get(sessionKey);
   if (existingSession) {
     if (!existingSession.messageId) {
-      await interaction.reply({
+      await interaction.editReply({
         content: "La sala ya se está preparando.",
-        ephemeral: true,
       });
       return;
     }
@@ -1103,9 +1158,8 @@ async function handleStartCommand(interaction: ChatInputCommandInteraction) {
         const existingMessage = await existingTextChannel.messages.fetch(
           existingSession.messageId,
         );
-        await interaction.reply({
+        await interaction.editReply({
           content: `Ya hay una sala activa para <#${voiceChannel.id}>: ${existingMessage.url}`,
-          ephemeral: true,
         });
         return;
       } catch (error) {
@@ -1128,7 +1182,12 @@ async function handleStartCommand(interaction: ChatInputCommandInteraction) {
   farmingSessions.set(sessionKey, session);
 
   try {
-    await interaction.reply({
+    const textChannel = interaction.channel;
+    if (!textChannel?.isTextBased() || !textChannel.isSendable()) {
+      throw new Error("The room text channel is not available for sending.");
+    }
+
+    const sessionMessage = await textChannel.send({
       content: `<@${interaction.user.id}>`,
       embeds: [
         buildSessionWelcomeEmbed(session),
@@ -1140,8 +1199,10 @@ async function handleStartCommand(interaction: ChatInputCommandInteraction) {
       components: [buildRegistrationPanel(voiceChannel.id)],
       allowedMentions: { users: [interaction.user.id] },
     });
-    const sessionMessage = await interaction.fetchReply();
     session.messageId = sessionMessage.id;
+    await interaction.editReply({
+      content: `Sala iniciada para <#${voiceChannel.id}>: ${sessionMessage.url}`,
+    });
     await deleteRegistrationPanel(guildId, interaction.user.id);
     await publishRosterForChannel(guildId, voiceChannel.id);
   } catch (error) {
@@ -1155,9 +1216,8 @@ async function handleStartCommand(interaction: ChatInputCommandInteraction) {
 async function handleStopCommand(interaction: ChatInputCommandInteraction) {
   const guildId = interaction.guildId;
   if (!guildId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este comando solo funciona dentro de un servidor.",
-      ephemeral: true,
     });
     return;
   }
@@ -1168,9 +1228,8 @@ async function handleStopCommand(interaction: ChatInputCommandInteraction) {
     (!hasAuthorizedRole(member) &&
       !member.permissions.has(PermissionsBitField.Flags.Administrator))
   ) {
-    await interaction.reply({
+    await interaction.editReply({
       content: ACCESS_DENIED_MESSAGE,
-      ephemeral: true,
     });
     return;
   }
@@ -1194,10 +1253,9 @@ async function handleStopCommand(interaction: ChatInputCommandInteraction) {
         ? sessionsInTextChannel[0]
         : undefined;
     if (sessionsInTextChannel.length > 1) {
-      await interaction.reply({
+      await interaction.editReply({
         content:
           "Hay varias salas activas en este canal. Entra al canal de voz de la sala que quieres cerrar y vuelve a usar `/stop`.",
-        ephemeral: true,
       });
       return;
     }
@@ -1206,14 +1264,12 @@ async function handleStopCommand(interaction: ChatInputCommandInteraction) {
   const sessionKey = target?.[0];
   const session = target?.[1];
   if (!sessionKey || !session) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "No hay una sala de farmeo activa que puedas cerrar aquí.",
-      ephemeral: true,
     });
     return;
   }
 
-  await interaction.deferReply({ ephemeral: true });
   farmingSessions.delete(sessionKey);
 
   let panelUpdated = false;
@@ -1265,9 +1321,8 @@ async function handleButtonInteraction(interaction: ButtonInteraction) {
       farmingSessionKey(guildId, voiceChannelId),
     );
     if (!session || session.messageId !== interaction.message.id) {
-      await interaction.reply({
+      await interaction.editReply({
         content: "La sala de farmeo se encuentra cerrada o ya no está activa.",
-        ephemeral: true,
       });
       return;
     }
@@ -1276,10 +1331,9 @@ async function handleButtonInteraction(interaction: ButtonInteraction) {
     return;
   }
   if (interaction.customId === "mvr:register") {
-    await interaction.reply({
+    await interaction.editReply({
       content:
         "Este panel antiguo ya no está activo. Un usuario autorizado debe iniciar la sala con `/start`.",
-      ephemeral: true,
     });
   }
 }
@@ -1291,15 +1345,19 @@ async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
   const voiceChannelId = interaction.customId.split(":")[4];
 
   if (interaction.user.id !== userId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este registro pertenece a otra persona. Pulsa el botón para iniciar el tuyo.",
-      ephemeral: true,
     });
     return;
   }
 
   const role = interaction.values[0];
-  if (!role) return;
+  if (!role) {
+    await interaction.editReply({
+      content: "No se recibió un rol válido. Vuelve a seleccionar una opción.",
+    });
+    return;
+  }
 
   const guildId = interaction.guildId ?? "";
   const registrationMode = mode === "change" ? "change" : "register";
@@ -1309,14 +1367,14 @@ async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
       farmingSessions.has(farmingSessionKey(guildId, voiceChannelId)),
   );
   if (!hasActiveSession) {
-    await interaction.update({
+    await interaction.editReply({
       content: "La sala de farmeo se encuentra cerrada. No se aceptan interacciones.",
       components: [],
     });
     return;
   }
   if (member?.voice.channelId !== voiceChannelId) {
-    await interaction.update({
+    await interaction.editReply({
       content: "Debes estar en el canal de voz de esta sala para continuar.",
       components: [],
     });
@@ -1330,7 +1388,7 @@ async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
     voiceChannelId,
   });
 
-  await interaction.update({
+  await interaction.editReply({
     content: `Rol seleccionado: **${role}**\nAhora selecciona tu personaje:`,
     components: buildCharacterMenus(
       userId,
@@ -1347,9 +1405,8 @@ async function handleChangeRoleCommand(
 ) {
   const guildId = interaction.guildId;
   if (!guildId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este comando solo funciona dentro de un servidor.",
-      ephemeral: true,
     });
     return;
   }
@@ -1358,10 +1415,9 @@ async function handleChangeRoleCommand(
     registrationKey(guildId, interaction.user.id),
   );
   if (!registration) {
-    await interaction.reply({
+    await interaction.editReply({
       content:
         "Todavía no tienes un registro. Un usuario autorizado debe iniciar una sala con `/start` para habilitar el registro.",
-      ephemeral: true,
     });
     return;
   }
@@ -1369,16 +1425,14 @@ async function handleChangeRoleCommand(
   const member = await getGuildMember(guildId, interaction.user.id);
   const voiceChannel = member?.voice.channel;
   if (!voiceChannel) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar dentro de un canal de voz para cambiar tu rol.",
-      ephemeral: true,
     });
     return;
   }
   if (!isAllowedChannel(voiceChannel.id)) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar en un canal de voz permitido para cambiar tu rol.",
-      ephemeral: true,
     });
     return;
   }
@@ -1388,9 +1442,8 @@ async function handleChangeRoleCommand(
       farmingSessionKey(guildId, voiceChannel.id),
     )
   ) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "La sala de farmeo de tu registro está cerrada. Inicia una nueva con `/start`.",
-      ephemeral: true,
     });
     return;
   }
@@ -1402,14 +1455,13 @@ async function handleChangeRoleCommand(
     voiceChannelId: voiceChannel.id,
   });
 
-  await interaction.reply({
+  await interaction.editReply({
     content:
       `Registro actual: **${registration.role} · ${registration.character}**.\n` +
       "Selecciona tu nuevo rol:",
     components: [
       buildRoleMenu(interaction.user.id, "change", voiceChannel.id),
     ],
-    ephemeral: true,
   });
 }
 
@@ -1420,9 +1472,8 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
   const [, , , , , voiceChannelId] = interaction.customId.split(":");
 
   if (interaction.user.id !== userId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este registro pertenece a otra persona. Pulsa el botón para iniciar el tuyo.",
-      ephemeral: true,
     });
     return;
   }
@@ -1431,7 +1482,10 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
     pendingKey(interaction.guildId ?? "", userId),
   );
   if (!isPendingValid(pending)) {
-    await interaction.update({
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate();
+    }
+    await interaction.editReply({
       content: "Tu selección expiró. Vuelve a pulsar el botón de registro de una sala activa.",
       components: [],
     });
@@ -1439,11 +1493,23 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
   }
 
   const character = interaction.values[0];
-  if (!character || !pending) return;
+  if (!character || !pending) {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate();
+    }
+    await interaction.editReply({
+      content: "No se recibió un personaje válido. Vuelve a seleccionarlo.",
+      components: [],
+    });
+    return;
+  }
 
   const requestedMode = mode === "change" ? "change" : "register";
   if (pending.mode !== requestedMode) {
-    await interaction.update({
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate();
+    }
+    await interaction.editReply({
       content: "Esta selección ya no está activa. Vuelve a iniciar la acción desde el menú actual.",
       components: [],
     });
@@ -1451,32 +1517,36 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
   }
 
   const guildId = interaction.guildId ?? "";
-  const member = guildId ? await getGuildMember(guildId, userId) : null;
   const hasActiveSession = Boolean(
     voiceChannelId &&
       pending.voiceChannelId === voiceChannelId &&
       farmingSessions.has(farmingSessionKey(guildId, voiceChannelId)),
   );
   if (!hasActiveSession) {
-    await interaction.update({
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferUpdate();
+    }
+    await interaction.editReply({
       content: "La sala de farmeo se encuentra cerrada. No se aceptan interacciones.",
-      components: [],
-    });
-    return;
-  }
-  if (member?.voice.channelId !== voiceChannelId) {
-    await interaction.update({
-      content: "Debes estar en el canal de voz de esta sala para continuar.",
       components: [],
     });
     return;
   }
 
   if (pending.mode === "change") {
+    const member = guildId ? await getGuildMember(guildId, userId) : null;
+    if (member?.voice.channelId !== voiceChannelId) {
+      await interaction.editReply({
+        content: "Debes estar en el canal de voz de esta sala para continuar.",
+        components: [],
+      });
+      return;
+    }
+
     const key = registrationKey(interaction.guildId ?? "", userId);
     const existingRegistration = registrations.get(key);
     if (!existingRegistration) {
-      await interaction.update({
+      await interaction.editReply({
         content:
           "No tienes un registro activo. Pulsa el botón de registro para comenzar.",
         components: [],
@@ -1488,7 +1558,7 @@ async function handleCharacterSelection(interaction: StringSelectMenuInteraction
     existingRegistration.character = character;
     pendingRegistrations.delete(key);
 
-    await interaction.update({
+    await interaction.editReply({
       content:
         `Cambio realizado: ahora eres **${existingRegistration.role} · ${existingRegistration.character}**.\n` +
         "Tu ID de juego se mantuvo sin cambios.",
@@ -1516,18 +1586,16 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
   const sessionVoiceChannelId = interaction.customId.split(":")[5];
 
   if (interaction.user.id !== userId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este registro pertenece a otra persona.",
-      ephemeral: true,
     });
     return;
   }
 
   const guildId = interaction.guildId;
   if (!guildId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Este registro solo está disponible dentro de un servidor.",
-      ephemeral: true,
     });
     return;
   }
@@ -1537,9 +1605,8 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
       )
     : undefined;
   if (!session) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "La sala de farmeo se encuentra cerrada. No se aceptan registros.",
-      ephemeral: true,
     });
     return;
   }
@@ -1548,11 +1615,10 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
   );
   if (existingRegistration) {
     pendingRegistrations.delete(pendingKey(guildId, userId));
-    await interaction.reply({
+    await interaction.editReply({
       content:
         `Ya estás registrado como **${existingRegistration.role} · ${existingRegistration.character}**.\n` +
         "Si quieres modificarlo, usa `/cambiar_rol`.",
-      ephemeral: true,
     });
     return;
   }
@@ -1560,26 +1626,23 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
   const member = await getGuildMember(guildId, userId);
   const voiceChannel = member?.voice.channel;
   if (!voiceChannel || voiceChannel.id !== sessionVoiceChannelId) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Debes estar en el canal de voz de esta sala para completar el registro.",
-      ephemeral: true,
     });
     return;
   }
   if (!isAllowedChannel(voiceChannel.id)) {
-    await interaction.reply({
+    await interaction.editReply({
       content:
         "Debes estar en un canal de voz permitido para completar el registro.",
-      ephemeral: true,
     });
     return;
   }
 
   const capacity = getChannelCapacity(guildId, voiceChannel.id, userId);
   if (!capacity.available) {
-    await interaction.reply({
+    await interaction.editReply({
       content: `Este canal ya está lleno: **${capacity.playerCount}/${MAX_PLAYERS}** jugadores.`,
-      ephemeral: true,
     });
     return;
   }
@@ -1592,9 +1655,8 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
       (option) => option.value === character,
     )
   ) {
-    await interaction.reply({
+    await interaction.editReply({
       content: "Ese personaje no está disponible para el rol seleccionado.",
-      ephemeral: true,
     });
     return;
   }
@@ -1618,9 +1680,8 @@ async function handleModalSubmit(interaction: ModalSubmitInteraction) {
     pendingKey(registration.guildId, registration.discordUserId),
   );
 
-  await interaction.reply({
+  await interaction.editReply({
     content: `Registro guardado: **${registration.role}** · **${registration.character}** · ID **${registration.gameId}**`,
-    ephemeral: true,
   });
 
   await deleteRegistrationPanel(guildId, userId);
@@ -1650,9 +1711,39 @@ async function handleInteraction(interaction: Interaction) {
   ) {
     return;
   }
-  if (!interaction.guildId || !isAllowedChannel(interaction.channelId)) return;
 
   try {
+    if (!interaction.guildId || !isAllowedChannel(interaction.channelId)) {
+      if (interaction.isRepliable()) {
+        await interaction.reply({
+          content: "Este comando solo está disponible en los canales permitidos del servidor.",
+          ephemeral: true,
+        });
+      }
+      return;
+    }
+
+    if (interaction.isChatInputCommand()) {
+      await interaction.deferReply({ ephemeral: true });
+    } else if (interaction.isButton()) {
+      await interaction.deferReply({ ephemeral: true });
+    } else if (interaction.isStringSelectMenu()) {
+      const [, , targetUserId, mode] = interaction.customId.split(":");
+      const belongsToAnotherUser = interaction.user.id !== targetUserId;
+      const opensRegistrationModal =
+        interaction.customId.startsWith("mvr:character:") &&
+        mode !== "change" &&
+        !belongsToAnotherUser;
+
+      if (belongsToAnotherUser) {
+        await interaction.deferReply({ ephemeral: true });
+      } else if (!opensRegistrationModal) {
+        await interaction.deferUpdate();
+      }
+    } else if (interaction.isModalSubmit()) {
+      await interaction.deferReply({ ephemeral: true });
+    }
+
     const isNoAfkCommand =
       interaction.isChatInputCommand() &&
       interaction.commandName === "noafk";
@@ -1674,43 +1765,70 @@ async function handleInteraction(interaction: Interaction) {
           )
         : interactionHasAuthorizedRole(interaction));
     if (!hasAccess) {
-      await interaction.reply({
-        content: ACCESS_DENIED_MESSAGE,
-        ephemeral: true,
-      });
+      if (interaction.deferred) {
+        await interaction.editReply({ content: ACCESS_DENIED_MESSAGE });
+      } else if (!interaction.replied) {
+        await interaction.reply({
+          content: ACCESS_DENIED_MESSAGE,
+          ephemeral: true,
+        });
+      }
       return;
     }
 
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === "start") {
-        await handleStartCommand(interaction);
+        await runInteractionHandler(
+          interaction,
+          "start command",
+          () => handleStartCommand(interaction),
+        );
       } else if (interaction.commandName === "cambiar_rol") {
-        await handleChangeRoleCommand(interaction);
+        await runInteractionHandler(
+          interaction,
+          "change-role command",
+          () => handleChangeRoleCommand(interaction),
+        );
       } else if (interaction.commandName === "stop") {
-        await handleStopCommand(interaction);
+        await runInteractionHandler(
+          interaction,
+          "stop command",
+          () => handleStopCommand(interaction),
+        );
       } else if (interaction.commandName === "noafk") {
-        await interaction.reply({
-          embeds: [buildNoAfkEmbed()],
+        await runInteractionHandler(interaction, "noafk command", async () => {
+          await interaction.editReply({ embeds: [buildNoAfkEmbed()] });
         });
       }
     } else if (interaction.isButton()) {
-      await handleButtonInteraction(interaction);
+      await runInteractionHandler(
+        interaction,
+        "button handler",
+        () => handleButtonInteraction(interaction),
+      );
     } else if (interaction.isStringSelectMenu()) {
       if (interaction.customId.startsWith("mvr:role:")) {
-        await handleRoleSelection(interaction);
+        await runInteractionHandler(
+          interaction,
+          "role selection handler",
+          () => handleRoleSelection(interaction),
+        );
       } else if (interaction.customId.startsWith("mvr:character:")) {
-        await handleCharacterSelection(interaction);
+        await runInteractionHandler(
+          interaction,
+          "character selection handler",
+          () => handleCharacterSelection(interaction),
+        );
       }
     } else if (interaction.isModalSubmit()) {
-      await handleModalSubmit(interaction);
+      await runInteractionHandler(
+        interaction,
+        "registration modal handler",
+        () => handleModalSubmit(interaction),
+      );
     }
   } catch (error) {
-    logger.error({ err: error }, "Discord interaction failed");
-    if (!interaction.isRepliable() || interaction.replied || interaction.deferred) return;
-    await interaction.reply({
-      content: "No pude completar el registro. Inténtalo otra vez.",
-      ephemeral: true,
-    });
+    await handleInteractionError(interaction, "interaction dispatcher", error);
   }
 }
 
