@@ -24,6 +24,7 @@ import {
   type StringSelectMenuInteraction,
   type VoiceState,
 } from "discord.js";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { logger } from "./logger";
@@ -78,6 +79,12 @@ type CharacterOption = {
   emojiId: string | undefined;
   iconFileName?: string;
   fallbackEmoji: string;
+};
+
+type CharacterEmoji = {
+  id: string;
+  name: string;
+  animated?: boolean;
 };
 
 const CHARACTER_EMOJI_IDS: Record<string, string> = {
@@ -150,6 +157,7 @@ const CHARACTER_ICON_FILES = {
   Magneto: "Magneto_Deluxe_Avatar_1790719333229.webp",
   Mantis: "Mantis_Deluxe_Avatar_1790719323557.webp",
   "Mister Fantastic": "Mister_Fantastic_Deluxe_Avatar_1790719328277.webp",
+  Nightcrawler: "../assets/Champion_Icon_Nightcrawler_Animated_Emoji.webp",
   "Peni Parker": "Peni_Parker_Deluxe_Avatar_1790719312173.webp",
   Phoenix: "item_herohead_21054020_1790718618645.webp",
   Psylocke: "Psylocke_Deluxe_Avatar_1790718740526.webp",
@@ -168,7 +176,6 @@ const CHARACTER_ICON_FILES = {
   "White Fox": "item_herohead_21060020_1790089355497.webp",
   "Winter Soldier": "Winter_Soldier_Deluxe_Avatar_1790718659591.webp",
   Wolverine: "Wolverine_Deluxe_Avatar_1790089404192.webp",
-  "Nightcrawler": "Nightcrawler_Deluxe_Avatar_1790718654529.webp",
 } satisfies Record<string, string>;
 
 const CHARACTER_EMOJI_NAME_OVERRIDES: Record<string, string> = {
@@ -245,9 +252,9 @@ const CHARACTERS_LIST: Record<CharacterRole, CharacterOption[]> = {
     character("Strategist", "Jeff"),
     character("Strategist", "Jubilee"),
     character("Strategist", "Mantis"),
+    character("Strategist", "Nightcrawler"),
     character("Strategist", "White Fox"),
     character("Strategist", "Deadpool"),
-    character("Strategist", "Nightcrawler"),
   ],
 };
 
@@ -258,6 +265,35 @@ const ATTACHED_ASSETS_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../../attached_assets",
 );
+const DISCORD_EMOJI_MAX_FILE_SIZE_BYTES = 256 * 1024;
+const CHARACTER_ICON_MIME_TYPES: Record<string, string> = {
+  ".avif": "image/avif",
+  ".gif": "image/gif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+async function readCharacterEmojiImage(iconFileName: string) {
+  const mimeType = CHARACTER_ICON_MIME_TYPES[path.extname(iconFileName).toLowerCase()];
+  if (!mimeType) {
+    throw new Error(`Unsupported character emoji image format: ${iconFileName}`);
+  }
+
+  const imagePath = iconFileName.startsWith("../assets/")
+    ? path.resolve(path.dirname(fileURLToPath(import.meta.url)), iconFileName)
+    : path.join(ATTACHED_ASSETS_DIR, iconFileName);
+  const image = await readFile(imagePath);
+  if (image.byteLength > DISCORD_EMOJI_MAX_FILE_SIZE_BYTES) {
+    throw new Error(
+      `Character emoji image exceeds Discord's 256 KiB limit: ${iconFileName} (${image.byteLength} bytes)`,
+    );
+  }
+
+  return `data:${mimeType};base64,${image.toString("base64")}`;
+}
+
 export const START_COMMAND = new SlashCommandBuilder()
   .setName("start")
   .setDescription("Inicia tu registro para una partida de Marvel Rivals")
@@ -316,9 +352,9 @@ const registrationPanelMessages = new Map<string, string>();
 const messageDeletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const characterEmojisByGuild = new Map<
   string,
-  Map<string, { id: string; name: string }>
+  Map<string, CharacterEmoji>
 >();
-const globalCharacterEmojis = new Map<string, { id: string; name: string }>();
+const globalCharacterEmojis = new Map<string, CharacterEmoji>();
 
 let client: Client | undefined;
 let connectedAt: string | undefined;
@@ -447,7 +483,11 @@ function buildCharacterMenus(
           const guildEmoji = guildCharacterEmojis?.get(character.value);
           const configuredEmojiInGuild =
             character.emojiId && guild?.emojis.cache.has(character.emojiId)
-              ? { id: character.emojiId, name: character.emojiName }
+              ? {
+                  id: character.emojiId,
+                  name: character.emojiName,
+                  animated: guild.emojis.cache.get(character.emojiId)?.animated,
+                }
               : undefined;
           const resolvedEmoji =
             globalEmoji ??
@@ -457,7 +497,11 @@ function buildCharacterMenus(
             label: character.name,
             value: character.value,
             emoji: resolvedEmoji
-              ? { id: resolvedEmoji.id, name: resolvedEmoji.name }
+              ? {
+                  id: resolvedEmoji.id,
+                  name: resolvedEmoji.name,
+                  ...(resolvedEmoji.animated ? { animated: true } : {}),
+                }
               : character.fallbackEmoji,
           };
         }),
@@ -498,6 +542,7 @@ async function syncCharacterEmojis(
         const linkedEmoji = {
           id: existingEmoji.id,
           name: existingEmoji.name ?? character.emojiName,
+          animated: existingEmoji.animated,
         };
         guildCharacterEmojis.set(character.value, linkedEmoji);
         if (!character.emojiId && !globalCharacterEmojis.has(character.value)) {
@@ -521,13 +566,14 @@ async function syncCharacterEmojis(
       }
 
       const createdEmoji = await guild.emojis.create({
-        attachment: path.join(ATTACHED_ASSETS_DIR, character.iconFileName),
+        attachment: await readCharacterEmojiImage(character.iconFileName),
         name: character.emojiName,
         reason: "Iconos de personajes para el registro de Marvel Rivals",
       });
       const createdEmojiData = {
         id: createdEmoji.id,
         name: createdEmoji.name ?? character.emojiName,
+        animated: createdEmoji.animated,
       };
       guildCharacterEmojis.set(character.value, createdEmojiData);
       globalCharacterEmojis.set(character.value, createdEmojiData);
@@ -599,6 +645,7 @@ async function syncCharacterEmojisAcrossGuilds(guilds: Guild[]) {
       globalCharacterEmojis.set(character.value, {
         id: existingEmoji.id,
         name: existingEmoji.name ?? character.emojiName,
+        animated: existingEmoji.animated,
       });
       break;
     }
