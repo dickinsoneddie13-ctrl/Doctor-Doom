@@ -156,6 +156,7 @@ const CHARACTER_ICON_FILES = {
   "White Fox": "item_herohead_21060020_1790089355497.webp",
   "Winter Soldier": "Winter_Soldier_Deluxe_Avatar_1790718659591.webp",
   Wolverine: "Wolverine_Deluxe_Avatar_1790089404192.webp",
+  "Nightcrawler": "Nightcrawler_Deluxe_Avatar_1790718654641.webp",
 } satisfies Record<string, string>;
 
 const CHARACTER_EMOJI_NAME_OVERRIDES: Record<string, string> = {
@@ -234,6 +235,7 @@ const CHARACTERS_LIST: Record<CharacterRole, CharacterOption[]> = {
     character("Strategist", "Mantis"),
     character("Strategist", "White Fox"),
     character("Strategist", "Deadpool"),
+    character("Strategist", "Nightcrawler"),
   ],
 };
 
