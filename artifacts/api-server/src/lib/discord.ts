@@ -1027,6 +1027,7 @@ async function publishRoster(registration: PlayerRegistration) {
 async function beginRegistration(
   interaction: ButtonInteraction,
   expectedVoiceChannelId: string,
+  knownMember?: GuildMember | null,
 ) {
   const guildId = interaction.guildId;
   if (!guildId) {
@@ -1059,7 +1060,10 @@ async function beginRegistration(
     return false;
   }
 
-  const member = await getGuildMember(guildId, interaction.user.id);
+  const member =
+    knownMember === undefined
+      ? await getGuildMember(guildId, interaction.user.id)
+      : knownMember;
   if (!hasAuthorizedRole(member)) {
     await interaction.editReply({
       content: ACCESS_DENIED_MESSAGE,
@@ -1310,32 +1314,120 @@ async function handleStopCommand(interaction: ChatInputCommandInteraction) {
 
 async function handleButtonInteraction(interaction: ButtonInteraction) {
   const sessionButtonPrefix = "mvr:session-register:";
-  if (interaction.customId.startsWith(sessionButtonPrefix)) {
-    const voiceChannelId = interaction.customId.slice(
-      sessionButtonPrefix.length,
-    );
-    const guildId = interaction.guildId;
-    if (!guildId) return;
-
-    const session = farmingSessions.get(
-      farmingSessionKey(guildId, voiceChannelId),
-    );
-    if (!session || session.messageId !== interaction.message.id) {
-      await interaction.editReply({
-        content: "La sala de farmeo se encuentra cerrada o ya no está activa.",
-      });
-      return;
-    }
-
-    await beginRegistration(interaction, voiceChannelId);
+  const guildId = interaction.guildId;
+  if (!guildId || !client?.user || interaction.message.author.id !== client.user.id) {
+    await interaction.editReply({
+      content: "No pude validar el panel de registro de esta sala.",
+    });
     return;
   }
-  if (interaction.customId === "mvr:register") {
+
+  const isLegacyRegisterButton = interaction.customId === "mvr:register";
+  const voiceChannelId = interaction.customId.startsWith(sessionButtonPrefix)
+    ? interaction.customId.slice(sessionButtonPrefix.length)
+    : undefined;
+  if (!voiceChannelId && !isLegacyRegisterButton) return;
+
+  const member = isLegacyRegisterButton
+    ? await getGuildMember(guildId, interaction.user.id)
+    : undefined;
+  const currentVoiceChannelId = member?.voice.channelId ?? undefined;
+  const targetVoiceChannelId = voiceChannelId ?? currentVoiceChannelId;
+  if (!targetVoiceChannelId) {
     await interaction.editReply({
-      content:
-        "Este panel antiguo ya no está activo. Un usuario autorizado debe iniciar la sala con `/start`.",
+      content: "Debes estar dentro del canal de voz de una sala activa para registrarte.",
     });
+    return;
   }
+
+  if (
+    currentVoiceChannelId &&
+    currentVoiceChannelId !== targetVoiceChannelId
+  ) {
+    await interaction.editReply({
+      content: "Debes estar en el canal de voz de esta sala para registrarte.",
+    });
+    return;
+  }
+
+  const sessionKey = farmingSessionKey(guildId, targetVoiceChannelId);
+  let session = farmingSessions.get(sessionKey);
+  const panelEmbed = interaction.message.embeds.find((embed) =>
+    embed.title?.startsWith("Bienvenido al farmeo, "),
+  );
+  const panelVoiceChannelId = panelEmbed?.description?.match(
+    /abrió la sala en <#(\d+)>/,
+  )?.[1];
+  const panelIsClosed = interaction.message.embeds.some(
+    (embed) => embed.title === "Sala de farmeo cerrada",
+  );
+  const hasActiveButton = interaction.message.components.some((row) =>
+    "components" in row &&
+      row.components.some(
+        (component) =>
+          "customId" in component && component.customId === interaction.customId,
+      ),
+  );
+  const canRestoreLegacyPanel =
+    isLegacyRegisterButton &&
+    currentVoiceChannelId === targetVoiceChannelId &&
+    !panelEmbed;
+
+  if (
+    panelIsClosed ||
+    !hasActiveButton ||
+    (panelVoiceChannelId && panelVoiceChannelId !== targetVoiceChannelId)
+  ) {
+    await interaction.editReply({
+      content: "La sala de farmeo se encuentra cerrada o ya no está activa.",
+    });
+    return;
+  }
+
+  if (
+    !session &&
+    ((panelEmbed && panelVoiceChannelId === targetVoiceChannelId) ||
+      canRestoreLegacyPanel)
+  ) {
+    const openedByUserId =
+      interaction.message.content.match(/<@!?(\d+)>/)?.[1] ??
+      panelEmbed?.description?.match(/<@!?(\d+)>/)?.[1] ??
+      (canRestoreLegacyPanel ? interaction.user.id : undefined);
+    const openedByDisplayName =
+      panelEmbed?.title
+        ?.replace(/^Bienvenido al farmeo,\s*/, "")
+        .trim() ??
+      (canRestoreLegacyPanel ? member?.displayName : undefined);
+
+    if (openedByUserId && openedByDisplayName) {
+      session = {
+        guildId,
+        voiceChannelId: targetVoiceChannelId,
+        textChannelId: interaction.channelId,
+        openedByUserId,
+        openedByDisplayName,
+        messageId: interaction.message.id,
+      };
+      farmingSessions.set(sessionKey, session);
+      logger.info(
+        {
+          guildId,
+          voiceChannelId: targetVoiceChannelId,
+          messageId: interaction.message.id,
+        },
+        "Open farming session restored from its registration panel",
+      );
+    }
+  }
+
+  if (!session) {
+    await interaction.editReply({
+      content: "La sala de farmeo se encuentra cerrada o ya no está activa.",
+    });
+    return;
+  }
+
+  await beginRegistration(interaction, targetVoiceChannelId, member);
 }
 
 async function handleRoleSelection(interaction: StringSelectMenuInteraction) {
